@@ -1,0 +1,77 @@
+# indicate-speaker.toml — config for the let's-play crew.
+#
+# Put the episode's four MKVs in one folder and run:
+#   python3 indicate-speaker.py --contact-sheet            # preview the look
+#   python3 indicate-speaker.py --indir /path/to/episode --jobs 4
+#
+# First time with a new recording setup, run --discover to identify tracks:
+#   python3 indicate-speaker.py --discover --indir /path/to/episode
+#
+# Source files are found automatically by suffix: a person with suffix "k"
+# matches  YYYY-MM-DD_k.mkv  in --indir (the date is detected for you). If a
+# folder holds more than one episode, add  --date 2026-06-13  to disambiguate.
+
+[project]
+width  = 1920
+height = 1080
+fps    = 60
+stream_title = "Track2"   # the audio stream title read from each MKV
+
+[input]
+# dir  = "/path/to/episode"    # or pass --indir on the command line
+# date = "2026-06-13"          # or pass --date; omit to auto-detect by suffix
+
+# --- Optional fine-tuning. Delete any line to use the default shown. ---
+[layout]
+head_size     = 56     # head size in px at 100% (while speaking)
+gap           = 8      # vertical gap between heads
+margin_top    = 12
+margin_left   = 12
+silent_scale  = 0.88   # head shrinks to this fraction when fully quiet
+silent_dim    = 0.78   # head dims to this brightness/opacity when fully quiet
+glow_strength = 0.55   # peak opacity of the coloured glow (scales all bloom layers)
+ring_width    = 3
+breath_freq   = 0.40   # Hz; idle breathing pulse rate (lower = slower, dreamier)
+breath_scale  = 0.06   # ±fraction brightness swing while silent (0 = off)
+
+[gate]
+open_db              = -38.0  # envelope starts rising above this loudness
+full_db              = -16.0  # envelope hits 100% at/above this
+close_db             = -46.0  # below this, forced to silent (room tone, breaths)
+spring_stiffness     = 400.0  # k; higher = snappier snap-to-speaking
+spring_damping_ratio = 0.65   # ζ; 1.0 = no overshoot, 0.4 = noticeably bouncy
+# normalize = true     # derive open/full per person from their own levels
+                       # (equal visual activation regardless of mic volume)
+                       # can also be set with --normalize on the command line
+# norm_low_pct  = 15.0 # percentile of active frames used as open_db
+# norm_high_pct = 90.0 # percentile of active frames used as full_db
+
+# --- The crew, top to bottom on screen. ---
+# `suffix` is the letter in the filename. `nick` fetches the head from
+# mc-heads.net; to use local PNGs instead add e.g. head_file = "heads/seetee.png".
+# `stream_title` overrides the project-level default for this person only;
+# run --discover to identify and save the right title automatically.
+
+[[person]]
+name   = "Kenneth"
+suffix = "k"
+nick   = "seetee"
+colour = "#ff4da6"   # hot pink
+
+[[person]]
+name   = "Henrik"
+suffix = "h"
+nick   = "endemism"
+colour = "#e23636"   # red
+
+[[person]]
+name   = "Robin"
+suffix = "r"
+nick   = "v_eteris"
+colour = "#2f86e0"   # blue
+
+[[person]]
+name   = "Joel"
+suffix = "j"
+nick   = "delvispresley"
+colour = "#36b14a"   # green
