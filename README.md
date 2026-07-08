@@ -172,12 +172,16 @@ full_db              = -16.0  # activation hits 1.0 at/above this dBFS
 close_db             = -46.0  # below this, forced to silence (ignores room tone)
 spring_stiffness     = 400.0  # k; higher = faster snap to speaking
 spring_damping_ratio = 0.65   # ζ; 1.0 = no overshoot, 0.4 = noticeably bouncy
-normalize            = false  # true = derive open/full per-person from their track
+normalize            = false  # true = derive open/full/close per-person from their track
 norm_low_pct         = 15.0   # percentile of active frames mapped to open_db
 norm_high_pct        = 90.0   # percentile of active frames mapped to full_db
 ```
 
-**`normalize`** is useful when players have significantly different mic levels: it measures each person's own loudness distribution and scales the activation relative to it, so a quieter mic lights up the indicator just as strongly as a loud one. Can also be enabled per-run with `--normalize`.
+**`normalize`** is useful when players have significantly different mic levels: it measures each person's own loudness distribution (noise floor and speech peak) and derives all three thresholds from it, so a quieter mic lights up the indicator just as strongly as a loud one — even a mic recorded tens of dB below the configured thresholds. Can also be enabled per-run with `--normalize`.
+
+Any `[gate]` value can also be set inside a `[[person]]` section to override it for that person only — handy for one unusually quiet or loud mic.
+
+The script also warns when something looks wrong with the audio: when a person's loudness never reaches the gate (the head would stay dark for the whole episode), and when another stream — typically game audio — appears to bleed into the chosen voice track (checked by correlating the streams over a sample from the middle of the recording).
 
 ### `[[person]]`
 
@@ -191,6 +195,7 @@ nick         = "seetee"         # Minecraft username; fetches head from mc-heads
 colour       = "#ff4da6"        # ring, glow, and corner accent colour
 # head_file  = "heads/k.png"   # use a local PNG instead of mc-heads.net
 # stream_title = "Voice audio" # overrides [project] stream_title for this person
+# open_db    = -60.0           # any [gate] value can be overridden per person
 ```
 
 `nick` and `head_file` are mutually exclusive; at least one is required. Run `--discover` once after a new recording session if the audio track names have changed — it will find the right `stream_title` for each player and write it into the config.

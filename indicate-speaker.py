@@ -75,10 +75,10 @@ import time
 import tomllib
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
-from typing import Callable, NoReturn
+from typing import Callable, NamedTuple, NoReturn
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
@@ -228,6 +228,7 @@ class Person:
     nick: str | None = None
     head_file: Path | None = None
     stream_title: str = "Voice audio"
+    gate: Gate | None = None     # the global [gate] plus this person's overrides
 
 
 # --------------------------------------------------------------------------
@@ -327,31 +328,49 @@ def frame_loudness_db(path: Path, stream_index: int, fps: float, n_frames: int,
     return 20.0 * np.log10(rms + 1e-9)
 
 
-def activation_envelope(db: np.ndarray, fps: float,
-                        g: Gate) -> tuple[np.ndarray, float, float]:
+class Envelope(NamedTuple):
+    env: np.ndarray      # per-frame 0..1 speaking activation
+    open_db: float       # thresholds actually used (post-normalise)
+    full_db: float
+    close_db: float
+    peak_db: float       # 99.5th-percentile loudness of the whole track
+
+
+def activation_envelope(db: np.ndarray, fps: float, g: Gate) -> Envelope:
     """Map loudness to a smooth 0..1 speaking activation.
 
-    Returns (envelope, open_db_used, full_db_used). When normalize is on the
-    returned thresholds are derived from this person's own loudness distribution
-    rather than the global config values.
+    When normalize is on, all three thresholds — including the close/force-
+    silent cutoff — are derived from this person's own loudness distribution
+    rather than the config values, so a mic recorded 30 dB quieter than the
+    rest still animates. (An absolute close_db would zero out such a track
+    before the percentile statistics ever saw it.)
     """
     open_db = g.open_db
     full_db = g.full_db
+    close_db = g.close_db
+    peak_db = float(np.percentile(db, 99.5))
 
     if g.normalize:
-        active = db[db > g.close_db]
-        # Require at least one second of detectable audio before trusting stats.
-        # If the track has many near-floor frames (breaths, noise that just
-        # passed close_db), norm_low_pct may land close to close_db and make
-        # the indicator over-sensitive. Raise norm_low_pct in the config if
-        # the head reacts to near-silence.
-        if len(active) >= max(64, int(fps)):
-            open_db = float(np.percentile(active, g.norm_low_pct))
-            full_db = float(np.percentile(active, g.norm_high_pct))
+        # Speech has a bounded dynamic range: anything more than ~25 dB below
+        # this track's loud speech (the peak) is not speech. Anchoring the
+        # speech/silence cutoff to the peak — not the floor — keeps it sane
+        # for mics whose noise gate turns silence into -180 dB digital zero.
+        # Falls back to the config thresholds when the track has too little
+        # contrast (near-empty or constant noise) to trust the statistics.
+        floor_db = float(np.percentile(db, 20))
+        if peak_db - floor_db > 12.0:
+            cut = max(peak_db - 25.0, floor_db + 6.0)
+            active = db[db > cut]
+            # Require at least one second of detectable audio. If the head
+            # reacts to near-silence, raise norm_low_pct in the config.
+            if len(active) >= max(64, int(fps)):
+                open_db = float(np.percentile(active, g.norm_low_pct))
+                full_db = float(np.percentile(active, g.norm_high_pct))
+                close_db = min(cut, open_db - 2.0)
 
     span = max(1e-6, full_db - open_db)
     raw = np.clip((db - open_db) / span, 0.0, 1.0)
-    raw[db < g.close_db] = 0.0
+    raw[db < close_db] = 0.0
 
     # Second-order mass-spring-damper via semi-implicit Euler. The gate signal
     # is the rest position; underdamping (ζ < 1) produces a natural overshoot
@@ -366,7 +385,7 @@ def activation_envelope(db: np.ndarray, fps: float,
         v += (g.spring_stiffness * (target - x) - c * v) * dt
         x += v * dt
         out[i] = max(0.0, x)
-    return out, open_db, full_db
+    return Envelope(out, open_db, full_db, close_db, peak_db)
 
 
 def speaking_envelope(person: Person, stream_index: int, layout: Layout,
@@ -374,7 +393,7 @@ def speaking_envelope(person: Person, stream_index: int, layout: Layout,
                       voice_out: Path | None = None,
                       limit_s: float | None = None,
                       abort: threading.Event | None = None,
-                      ) -> tuple[np.ndarray, float, float]:
+                      ) -> Envelope:
     dur_s = limit_s if limit_s is not None else n_frames / layout.fps
     ap = Progress(dur_s * ANALYSIS_RATE,
                   f"  {person.name}: analysing audio", live)
@@ -382,6 +401,71 @@ def speaking_envelope(person: Person, stream_index: int, layout: Layout,
                            progress_cb=ap.update, voice_out=voice_out,
                            limit_s=limit_s, abort=abort)
     return activation_envelope(db, layout.fps, gate)
+
+
+BLEED_WINDOW_S = 300.0     # sampled from the middle of the recording
+BLEED_SIG_DB = -60.0       # a sibling stream counts as audible above this
+BLEED_MIN_DROP_DB = -8.0   # voice floor this close to the sibling ⇒ bleed
+
+
+def check_track_bleed(person: Person, aidx: int, duration: float) -> None:
+    """Warn when another audio stream leaks into the chosen voice stream.
+
+    Samples a window from the middle of the recording. While a sibling
+    stream (game audio, say) is clearly audible, a clean mic track still has
+    moments of near-silence far below the sibling's level; if the voice
+    envelope never drops meaningfully below the sibling's, the sibling is
+    playing inside the voice track — usually OBS routing desktop/game audio
+    onto the mic track.
+    """
+    if duration < 120.0:
+        return
+    streams = [s for s in ffprobe_streams(person.source)
+               if s.get("codec_type") == "audio"]
+    if len(streams) < 2:
+        return
+    win = min(BLEED_WINDOW_S, duration / 2)
+    start = duration / 2 - win / 2
+
+    def env_db(index: int) -> np.ndarray | None:
+        out = subprocess.run(
+            ["ffmpeg", "-v", "error", "-ss", f"{start:.3f}", "-t", f"{win:.3f}",
+             "-i", str(person.source), "-map", f"0:{index}", "-ac", "1",
+             "-ar", str(ANALYSIS_RATE), "-f", "s16le", "pipe:1"],
+            capture_output=True)
+        if out.returncode != 0:
+            return None
+        a = np.frombuffer(out.stdout, dtype=np.int16).astype(np.float64)
+        w = ANALYSIS_RATE // 10                # 100 ms frames
+        n = len(a) // w
+        if n < 300:                            # need at least 30 s
+            return None
+        rms = np.sqrt((a[:n * w].reshape(n, w) ** 2).mean(axis=1))
+        return 20.0 * np.log10(rms / 32768.0 + 1e-9)
+
+    voice = env_db(aidx)
+    if voice is None:
+        return
+    for s in streams:
+        idx = int(s["index"])
+        if idx == aidx:
+            continue
+        other = env_db(idx)
+        if other is None:
+            continue
+        n = min(len(voice), len(other))
+        v, o = voice[:n], other[:n]
+        sig = o > BLEED_SIG_DB
+        if sig.sum() < 100:                    # sibling mostly silent here;
+            continue                           # no verdict either way
+        drop = float(np.percentile(v[sig] - o[sig], 10))
+        if drop > BLEED_MIN_DROP_DB:
+            title = s.get("tags", {}).get("title", "<untitled>")
+            print(f"  {person.name}: warning: stream '{title}' appears to play "
+                  f"inside the voice track (the voice never drops more than "
+                  f"{-drop:.0f} dB below it) — in OBS Advanced Audio "
+                  f"Properties, that source is probably also routed onto the "
+                  f"voice track.", flush=True)
 
 
 # --------------------------------------------------------------------------
@@ -537,15 +621,33 @@ def build_render_cmd(canvas: str, layout: Layout, x: int, y: int, s: int,
 def _print_summary(person: Person, duration: float, speaking_s: float,
                    aidx: int, note: str, live: bool,
                    gate: Gate | None = None,
-                   open_db: float | None = None,
-                   full_db: float | None = None) -> None:
+                   res: Envelope | None = None) -> None:
     norm_note = ""
-    if gate is not None and gate.normalize and open_db is not None and full_db is not None:
-        norm_note = f" [normalised open={open_db:.0f} dB  full={full_db:.0f} dB]"
+    if gate is not None and gate.normalize and res is not None:
+        norm_note = (f" [normalised open={res.open_db:.0f}"
+                     f"  full={res.full_db:.0f}"
+                     f"  close={res.close_db:.0f} dB]")
     line = (f"  {person.name}: {duration:.1f}s, "
             f"~{speaking_s / 60:.1f} min speaking "
             f"(stream {aidx} '{person.stream_title}'){note}{norm_note}")
     print(("\r" + line + " " * 16) if live else line, flush=True)
+
+
+def _warn_weak_signal(person: Person, duration: float, speaking_s: float,
+                      res: Envelope) -> None:
+    """Say so, loudly, when the gate can never (or almost never) open."""
+    if res.peak_db < res.open_db:
+        print(f"  {person.name}: WARNING: loudness peaks around "
+              f"{res.peak_db:.0f} dB but the gate only opens above "
+              f"{res.open_db:.0f} dB — the head will never light up. Raise "
+              f"the mic gain in OBS for future sessions; for this file use "
+              f"--normalize or set open_db/full_db/close_db in this person's "
+              f"[[person]] section.", flush=True)
+    elif duration >= 120.0 and speaking_s < max(5.0, 0.002 * duration):
+        print(f"  {person.name}: warning: only {speaking_s:.0f}s of speech "
+              f"detected in {_fmt_dur(duration)} — if they talked more than "
+              f"that, the gate thresholds are too high for this mic "
+              f"(try --normalize).", flush=True)
 
 
 def render_overlay(person: Person, idx: int, layout: Layout, gate: Gate,
@@ -553,31 +655,35 @@ def render_overlay(person: Person, idx: int, layout: Layout, gate: Gate,
                    dry_run: bool, live: bool = True,
                    abort: threading.Event | None = None) -> None:
     aidx = find_audio_index(person.source, person.stream_title)
-    duration = media_duration(person.source)
-    if preview_s:
-        duration = min(duration, preview_s)
+    full_duration = media_duration(person.source)
+    duration = min(full_duration, preview_s) if preview_s else full_duration
     n_frames = int(math.ceil(duration * layout.fps))
     s = layout.sprite
     x, y = layout.cell_origin(idx)
     note = f" [place at X={x} Y={y}, size {s}x{s}]" if canvas == "tight" else ""
 
+    check_track_bleed(person, aidx, full_duration)
+
     if dry_run:
-        env, open_db, full_db = speaking_envelope(
+        res = speaking_envelope(
             person, aidx, layout, gate, n_frames, live,
             limit_s=preview_s, abort=abort)
-        speaking_s = float((env > 0.15).sum()) / layout.fps
+        speaking_s = float((res.env > 0.15).sum()) / layout.fps
         _print_summary(person, duration, speaking_s, aidx, note, live,
-                       gate, open_db, full_db)
+                       gate, res)
+        _warn_weak_signal(person, duration, speaking_s, res)
         return
 
     with tempfile.TemporaryDirectory(prefix="indspk_") as td:
         voice = Path(td) / "voice.m4a"
-        env, open_db, full_db = speaking_envelope(
+        res = speaking_envelope(
             person, aidx, layout, gate, n_frames, live,
             voice_out=voice, limit_s=preview_s, abort=abort)
+        env = res.env
         speaking_s = float((env > 0.15).sum()) / layout.fps
         _print_summary(person, duration, speaking_s, aidx, note, live,
-                       gate, open_db, full_db)
+                       gate, res)
+        _warn_weak_signal(person, duration, speaking_s, res)
 
         levels = np.clip((env * (LEVELS - 1)).round().astype(np.int64),
                          0, LEVELS - 1)
@@ -679,6 +785,10 @@ def load_config(path: Path) -> tuple[Layout, Gate, list[Person], dict]:
             stream_title=pc.get("stream_title",
                                 cfg.get("project", {}).get(
                                     "stream_title", "Voice audio")),
+            # any [gate] key can be overridden inside a [[person]] section
+            gate=replace(gate, **{k: pc[k]
+                                  for k in Gate.__dataclass_fields__
+                                  if k in pc}),
         ))
     if not people:
         die("config defines no [[person]] sections")
@@ -873,6 +983,8 @@ def _main(args: argparse.Namespace) -> None:
 
     if args.normalize:
         gate.normalize = True
+        for p in people:
+            p.gate.normalize = True
 
     canvas = args.canvas or out_cfg.get("canvas", "tight")
     indir = (args.indir or (Path(in_cfg["dir"]) if "dir" in in_cfg
@@ -922,8 +1034,8 @@ def _main(args: argparse.Namespace) -> None:
         idx, person = item
         out_path = outdir / f"{person.name.lower()}_speaker.mov"
         try:
-            render_overlay(person, idx, layout, gate, out_path, canvas,
-                           args.preview, args.dry_run, live, abort)
+            render_overlay(person, idx, layout, person.gate or gate, out_path,
+                           canvas, args.preview, args.dry_run, live, abort)
         except BaseException:
             abort.set()      # tell sibling jobs to stop promptly
             raise

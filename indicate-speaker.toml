@@ -40,11 +40,15 @@ full_db              = -16.0  # envelope hits 100% at/above this
 close_db             = -46.0  # below this, forced to silent (room tone, breaths)
 spring_stiffness     = 400.0  # k; higher = snappier snap-to-speaking
 spring_damping_ratio = 0.65   # ζ; 1.0 = no overshoot, 0.4 = noticeably bouncy
-# normalize = true     # derive open/full per person from their own levels
-                       # (equal visual activation regardless of mic volume)
+# normalize = true     # derive open/full/close per person from their own
+                       # levels (equal visual activation regardless of mic
+                       # volume, even for a mic recorded far too quietly)
                        # can also be set with --normalize on the command line
 # norm_low_pct  = 15.0 # percentile of active frames used as open_db
 # norm_high_pct = 90.0 # percentile of active frames used as full_db
+
+# Any [gate] value can also be set inside a [[person]] section to override it
+# for that person only, e.g. open_db = -60.0 for one unusually quiet mic.
 
 # --- The crew, top to bottom on screen. ---
 # `suffix` is the letter in the filename. `nick` fetches the head from
@@ -61,7 +65,7 @@ colour = "#ff4da6"   # hot pink
 
 [[person]]
 name   = "Henrik"
-stream_title = "Mikrofon - Henrik"
+stream_title = "Track2"
 suffix = "h"
 nick   = "endemism"
 colour = "#e23636"   # red
