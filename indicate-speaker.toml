@@ -54,24 +54,28 @@ spring_damping_ratio = 0.65   # ζ; 1.0 = no overshoot, 0.4 = noticeably bouncy
 
 [[person]]
 name   = "Kenneth"
+stream_title = "Voice audio"
 suffix = "k"
 nick   = "seetee"
 colour = "#ff4da6"   # hot pink
 
 [[person]]
 name   = "Henrik"
+stream_title = "Mikrofon - Henrik"
 suffix = "h"
 nick   = "endemism"
 colour = "#e23636"   # red
 
 [[person]]
 name   = "Robin"
+stream_title = "Track2"
 suffix = "r"
 nick   = "v_eteris"
 colour = "#2f86e0"   # blue
 
 [[person]]
 name   = "Joel"
+stream_title = "Track2"
 suffix = "j"
 nick   = "delvispresley"
 colour = "#36b14a"   # green
