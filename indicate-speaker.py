@@ -17,6 +17,11 @@
 # with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["numpy", "Pillow"]
+# ///
 """
 indicate-speaker.py — per-voice "who is speaking" overlays for let's-play editing.
 
@@ -82,12 +87,13 @@ from pathlib import Path
 from typing import Callable, NamedTuple, NoReturn
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
 __version__ = "1.0"
 
 ANALYSIS_RATE = 8000      # Hz, mono; ample for loudness, cheap to decode
 LEVELS = 64               # quantised activation steps -> pre-rendered sprites
+FRAME_CACHE_MAX = 512     # memoised breath-dimmed frames (~20 MB at defaults)
 HEAD_FETCH_PX = 256       # size to fetch from the skin API before downscaling
 MAX_HEAD_BYTES = 4 << 20  # refuse skin-API responses larger than this
 
@@ -541,7 +547,11 @@ def load_head(person: Person) -> Image.Image:
     if person.head_file:
         if not person.head_file.is_file():
             die(f"{person.name}: head_file not found: {person.head_file}")
-        return Image.open(person.head_file).convert("RGBA")
+        try:
+            return Image.open(person.head_file).convert("RGBA")
+        except OSError as exc:
+            die(f"{person.name}: could not read head_file "
+                f"{person.head_file}: {exc}")
     if not person.nick:
         die(f"{person.name}: needs either nick or head_file")
 
@@ -673,14 +683,19 @@ def contact_sheet(people: list[Person], layout: Layout, out: Path) -> None:
                        len(people) * cell_h + pad + label_h),
                       (32, 33, 36, 255))
     d = ImageDraw.Draw(sheet)
-    d.text((pad, pad // 2), "quiet", fill=(200, 200, 200, 255))
-    d.text((pad + cell_w, pad // 2), "speaking", fill=(200, 200, 200, 255))
+    try:
+        font = ImageFont.load_default(size=15)
+    except TypeError:      # Pillow < 10.1: only the tiny fixed-size default
+        font = ImageFont.load_default()
+    d.text((pad, pad // 2), "quiet", fill=(200, 200, 200, 255), font=font)
+    d.text((pad + cell_w, pad // 2), "speaking", fill=(200, 200, 200, 255),
+           font=font)
     for row, (p, sprites) in enumerate(zip(people, sprites_by_person)):
         y0 = label_h + pad + row * cell_h
         for col, level in enumerate((0, LEVELS - 1)):
             img = Image.fromarray(sprites[level], "RGBA")
             sheet.alpha_composite(img, (pad + col * cell_w + pad // 2, y0))
-        d.text((pad, y0 + s + 2), p.name, fill=(230, 230, 230, 255))
+        d.text((pad, y0 + s + 2), p.name, fill=(230, 230, 230, 255), font=font)
     sheet.save(out)
     print(f"Contact sheet written: {out}")
 
@@ -756,7 +771,10 @@ def render_overlay(person: Person, idx: int, layout: Layout, gate: Gate,
     x, y = layout.cell_origin(idx)
     note = f" [place at X={x} Y={y}, size {s}x{s}]" if canvas == "tight" else ""
 
-    check_track_bleed(person, aidx, full_duration)
+    # the bleed check decodes minutes from the middle of the full recording —
+    # too slow for a quick look, so previews skip it
+    if preview_s is None:
+        check_track_bleed(person, aidx, full_duration)
 
     if dry_run:
         res = speaking_envelope(
@@ -787,6 +805,8 @@ def render_overlay(person: Person, idx: int, layout: Layout, gate: Gate,
                          0, LEVELS - 1)
         sprites = render_sprites(person, layout, head)
         sprites_f = [arr.astype(np.float32) for arr in sprites]
+        sprite_bytes = [arr.tobytes() for arr in sprites]
+        frame_cache: dict[tuple[int, int], bytes] = {}
         tmp_out = out_path.with_name(
             out_path.stem + ".partial" + out_path.suffix)
         cmd = build_render_cmd(canvas, layout, x, y, s, voice, tmp_out, n_frames)
@@ -809,11 +829,23 @@ def render_overlay(person: Person, idx: int, layout: Layout, gate: Gate,
                               * (1.0 - min(1.0, act_f))
                               * math.sin(2.0 * math.pi
                                          * layout.breath_freq * k / layout.fps))
-                    frame = np.clip(
-                        sprites_f[int(lvl)] * breath, 0.0, 255.0
-                    ).astype(np.uint8)
+                    li = int(lvl)
+                    if breath == 1.0:      # fully speaking, or breathing off
+                        payload = sprite_bytes[li]
+                    else:
+                        # breath quantised to 1/256 — below one 8-bit output
+                        # step — so the handful of recurring dim states become
+                        # cache hits instead of per-frame array maths
+                        key = (li, round(breath * 256))
+                        payload = frame_cache.get(key)
+                        if payload is None:
+                            payload = np.clip(
+                                sprites_f[li] * (key[1] / 256.0), 0.0, 255.0
+                            ).astype(np.uint8).tobytes()
+                            if len(frame_cache) < FRAME_CACHE_MAX:
+                                frame_cache[key] = payload
                     try:
-                        proc.stdin.write(frame.tobytes())
+                        proc.stdin.write(payload)
                     except BrokenPipeError:
                         broke = True       # ffmpeg died; its log is read below
                         break
@@ -1114,6 +1146,10 @@ def parse_args() -> argparse.Namespace:
                     help="force per-person thresholds for everyone (by "
                          "default, normalize=\"auto\" applies them only to "
                          "tracks where the configured gate clearly fails)")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="leave finished overlay files alone instead of "
+                         "re-rendering them (cheap retry after one person's "
+                         "render failed)")
     ap.add_argument("--refresh-heads", action="store_true",
                     help="re-download avatar heads instead of using the "
                          "cached copies (use after someone changes their skin)")
@@ -1224,6 +1260,10 @@ def _main(args: argparse.Namespace) -> None:
     def job(item: tuple[int, Person]) -> None:
         idx, person = item
         out_path = outdir / f"{person.name.lower()}_speaker.mov"
+        if args.skip_existing and out_path.is_file() and not args.dry_run:
+            print(f"  {person.name}: exists, skipped ({out_path.name})",
+                  flush=True)
+            return
         try:
             render_overlay(person, idx, layout, person.gate or gate, out_path,
                            canvas, args.preview, args.dry_run, live, abort)

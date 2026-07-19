@@ -53,7 +53,7 @@ pip install numpy Pillow
 ffmpeg -version
 ```
 
-No build step, no package to install — it is a single script.
+No build step, no package to install — it is a single script. With [uv](https://docs.astral.sh/uv/) you can skip step 2 entirely: `uv run indicate-speaker.py …` reads the script's inline dependency metadata (PEP 723) and fetches NumPy and Pillow automatically.
 
 ---
 
@@ -106,7 +106,8 @@ If `CONFIG.toml` is omitted the script looks for `indicate-speaker.toml` next to
 | `--normalize` | auto | Force per-person thresholds for everyone (by default they apply automatically only to tracks the configured gate clearly fails) |
 | `--contact-sheet` | off | Write a PNG preview of all heads and exit |
 | `--refresh-heads` | off | Re-download avatar heads instead of using cached copies |
-| `--preview SECONDS` | off | Only process the first N seconds |
+| `--preview SECONDS` | off | Only process the first N seconds (also skips the slow track-bleed check) |
+| `--skip-existing` | off | Leave finished overlays alone — cheap retry after one person's render failed |
 | `--dry-run` | off | Analyse audio and report speaking time; render nothing |
 
 ### Source file naming
@@ -214,6 +215,17 @@ colour       = "#ff4da6"        # ring, glow, and corner accent colour
 ```
 
 `nick` and `head_file` are mutually exclusive; at least one is required. Downloaded heads are cached in `~/.cache/indicate-speaker/`, so renders work offline after the first fetch; pass `--refresh-heads` after someone changes their skin. Run `--discover` once after a new recording session if the audio track names have changed — it will find the right `stream_title` for each player and write it into the config.
+
+---
+
+## Development
+
+Tests live in `tests/` and run either way:
+
+```bash
+python3 tests/test_indicate_speaker.py                            # no extra deps
+uv run --with pytest --with numpy --with pillow -m pytest tests/  # via pytest
+```
 
 ---
 
