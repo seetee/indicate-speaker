@@ -74,6 +74,7 @@ import threading
 import time
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, replace
 from io import BytesIO
@@ -88,6 +89,7 @@ __version__ = "1.0"
 ANALYSIS_RATE = 8000      # Hz, mono; ample for loudness, cheap to decode
 LEVELS = 64               # quantised activation steps -> pre-rendered sprites
 HEAD_FETCH_PX = 256       # size to fetch from the skin API before downscaling
+MAX_HEAD_BYTES = 4 << 20  # refuse skin-API responses larger than this
 
 _BLOOM_LAYERS = (          # (radius_factor, blur_factor, alpha_factor)
     (0.52, 0.06, 0.90),    # tight bright core
@@ -169,6 +171,18 @@ class Progress:
             print("\r" + line + " " * 24, flush=True)
         else:
             print(line, flush=True)
+
+
+_warn_lock = threading.Lock()
+_warnings: list[str] = []
+
+
+def warn(msg: str) -> None:
+    """Print a warning now and remember it for the end-of-run summary
+    (with parallel jobs, warnings otherwise drown between progress lines)."""
+    with _warn_lock:
+        _warnings.append(msg)
+    print(msg, flush=True)
 
 
 # --------------------------------------------------------------------------
@@ -296,6 +310,7 @@ def frame_loudness_db(path: Path, stream_index: int, fps: float, n_frames: int,
     if proc.stdout is None:
         die("internal error: ffmpeg stdout not captured")
     sample_pos = 0
+    pending = b""
     try:
         while True:
             if abort is not None and abort.is_set():
@@ -303,6 +318,14 @@ def frame_loudness_db(path: Path, stream_index: int, fps: float, n_frames: int,
             raw = proc.stdout.read(1 << 20)
             if not raw:
                 break
+            if pending:
+                raw = pending + raw
+                pending = b""
+            if len(raw) & 1:        # pipe reads can split a 16-bit sample
+                pending = raw[-1:]
+                raw = raw[:-1]
+                if not raw:
+                    continue
             samples = np.frombuffer(raw, dtype=np.int16).astype(np.float64)
             idx = ((np.arange(sample_pos, sample_pos + len(samples)) * fps)
                    / ANALYSIS_RATE).astype(np.int64)
@@ -461,40 +484,71 @@ def check_track_bleed(person: Person, aidx: int, duration: float) -> None:
         drop = float(np.percentile(v[sig] - o[sig], 10))
         if drop > BLEED_MIN_DROP_DB:
             title = s.get("tags", {}).get("title", "<untitled>")
-            print(f"  {person.name}: warning: stream '{title}' appears to play "
-                  f"inside the voice track (the voice never drops more than "
-                  f"{-drop:.0f} dB below it) — in OBS Advanced Audio "
-                  f"Properties, that source is probably also routed onto the "
-                  f"voice track.", flush=True)
+            warn(f"  {person.name}: warning: stream '{title}' appears to play "
+                 f"inside the voice track (the voice never drops more than "
+                 f"{-drop:.0f} dB below it) — in OBS Advanced Audio "
+                 f"Properties, that source is probably also routed onto the "
+                 f"voice track.")
 
 
 # --------------------------------------------------------------------------
 # Sprites
 # --------------------------------------------------------------------------
 
+def head_cache_path(nick: str) -> Path:
+    root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    safe = urllib.parse.quote(nick, safe="")
+    return root / "indicate-speaker" / f"{safe}_{HEAD_FETCH_PX}.png"
+
+
 def load_head(person: Person) -> Image.Image:
     if person.head_file:
         if not person.head_file.is_file():
             die(f"{person.name}: head_file not found: {person.head_file}")
         return Image.open(person.head_file).convert("RGBA")
-    if person.nick:
-        url = f"https://mc-heads.net/avatar/{person.nick}/{HEAD_FETCH_PX}.png"
+    if not person.nick:
+        die(f"{person.name}: needs either nick or head_file")
+
+    cache = head_cache_path(person.nick)
+    if cache.is_file():
         try:
-            req = urllib.request.Request(
-                url, headers={"User-Agent": "indicate-speaker"})
-            with urllib.request.urlopen(req, timeout=30) as r:
-                data = r.read()
-        except (urllib.error.URLError, OSError) as exc:
-            die(f"{person.name}: could not fetch head from {url}: {exc}. "
-                f"Provide head_file in the config instead.")
-        return Image.open(BytesIO(data)).convert("RGBA")
-    die(f"{person.name}: needs either nick or head_file")
+            return Image.open(cache).convert("RGBA")
+        except OSError:
+            cache.unlink(missing_ok=True)   # corrupt cache entry; refetch
+
+    url = (f"https://mc-heads.net/avatar/"
+           f"{urllib.parse.quote(person.nick, safe='')}/{HEAD_FETCH_PX}.png")
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "indicate-speaker"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = r.read(MAX_HEAD_BYTES + 1)
+    except (urllib.error.URLError, OSError) as exc:
+        die(f"{person.name}: could not fetch head from {url}: {exc}. "
+            f"Provide head_file in the config instead.")
+    if len(data) > MAX_HEAD_BYTES:
+        die(f"{person.name}: {url} returned more than "
+            f"{MAX_HEAD_BYTES >> 20} MB; refusing it")
+    try:
+        head = Image.open(BytesIO(data)).convert("RGBA")
+    except OSError as exc:
+        die(f"{person.name}: {url} did not return a usable image ({exc}). "
+            f"Provide head_file in the config instead.")
+    # cache only after a successful decode, so an API error page is never kept
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cache.with_name(cache.name + ".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, cache)
+    return head
 
 
-def render_sprites(person: Person, layout: Layout) -> list[np.ndarray]:
+def render_sprites(person: Person, layout: Layout,
+                   head: Image.Image | None = None) -> list[np.ndarray]:
     """Pre-render LEVELS activation states as (H, W, 4) uint8 numpy arrays."""
     s = layout.sprite
-    base_head = load_head(person).resize(
+    if head is None:
+        head = load_head(person)
+    base_head = head.resize(
         (layout.head_size, layout.head_size), Image.Resampling.LANCZOS)
     centre = s / 2
     r, gc, b = person.colour
@@ -637,17 +691,17 @@ def _warn_weak_signal(person: Person, duration: float, speaking_s: float,
                       res: Envelope) -> None:
     """Say so, loudly, when the gate can never (or almost never) open."""
     if res.peak_db < res.open_db:
-        print(f"  {person.name}: WARNING: loudness peaks around "
-              f"{res.peak_db:.0f} dB but the gate only opens above "
-              f"{res.open_db:.0f} dB — the head will never light up. Raise "
-              f"the mic gain in OBS for future sessions; for this file use "
-              f"--normalize or set open_db/full_db/close_db in this person's "
-              f"[[person]] section.", flush=True)
+        warn(f"  {person.name}: WARNING: loudness peaks around "
+             f"{res.peak_db:.0f} dB but the gate only opens above "
+             f"{res.open_db:.0f} dB — the head will never light up. Raise "
+             f"the mic gain in OBS for future sessions; for this file use "
+             f"--normalize or set open_db/full_db/close_db in this person's "
+             f"[[person]] section.")
     elif duration >= 120.0 and speaking_s < max(5.0, 0.002 * duration):
-        print(f"  {person.name}: warning: only {speaking_s:.0f}s of speech "
-              f"detected in {_fmt_dur(duration)} — if they talked more than "
-              f"that, the gate thresholds are too high for this mic "
-              f"(try --normalize).", flush=True)
+        warn(f"  {person.name}: warning: only {speaking_s:.0f}s of speech "
+             f"detected in {_fmt_dur(duration)} — if they talked more than "
+             f"that, the gate thresholds are too high for this mic "
+             f"(try --normalize).")
 
 
 def render_overlay(person: Person, idx: int, layout: Layout, gate: Gate,
@@ -674,6 +728,10 @@ def render_overlay(person: Person, idx: int, layout: Layout, gate: Gate,
         _warn_weak_signal(person, duration, speaking_s, res)
         return
 
+    # fetch the head first so a network or avatar problem fails in seconds,
+    # not after a full audio-analysis pass over the source
+    head = load_head(person)
+
     with tempfile.TemporaryDirectory(prefix="indspk_") as td:
         voice = Path(td) / "voice.m4a"
         res = speaking_envelope(
@@ -687,7 +745,7 @@ def render_overlay(person: Person, idx: int, layout: Layout, gate: Gate,
 
         levels = np.clip((env * (LEVELS - 1)).round().astype(np.int64),
                          0, LEVELS - 1)
-        sprites = render_sprites(person, layout)
+        sprites = render_sprites(person, layout, head)
         sprites_f = [arr.astype(np.float32) for arr in sprites]
         tmp_out = out_path.with_name(
             out_path.stem + ".partial" + out_path.suffix)
@@ -888,13 +946,15 @@ def patch_config_stream_titles(config_path: Path, choices: dict[str, str]) -> No
         if not nm or nm.group(1) not in choices:
             out.append(part)
             continue
-        title = choices[nm.group(1)]
+        # json.dumps escaping is valid TOML basic-string escaping; lambda
+        # replacements keep re.sub from interpreting backslashes in the title
+        entry = f"stream_title = {json.dumps(choices[nm.group(1)])}"
         if re.search(r'^stream_title\s*=', part, re.M):
             part = re.sub(r'^stream_title\s*=.*$',
-                          f'stream_title = "{title}"', part, flags=re.M, count=1)
+                          lambda m: entry, part, flags=re.M, count=1)
         else:
             part = re.sub(r'^(name\s*=.+)$',
-                          rf'\1\nstream_title = "{title}"', part,
+                          lambda m: f"{m.group(1)}\n{entry}", part,
                           flags=re.M, count=1)
         out.append(part)
     config_path.write_text("".join(out))
@@ -942,6 +1002,9 @@ def parse_args() -> argparse.Namespace:
                     help="derive open/full thresholds per person from their "
                          "own loudness distribution so quiet mics activate "
                          "the indicator as strongly as loud ones")
+    ap.add_argument("--refresh-heads", action="store_true",
+                    help="re-download avatar heads instead of using the "
+                         "cached copies (use after someone changes their skin)")
     ap.add_argument("--dry-run", action="store_true",
                     help="analyse audio and report, render nothing")
     ap.add_argument("--version", action="version",
@@ -993,6 +1056,11 @@ def _main(args: argparse.Namespace) -> None:
     outdir = args.outdir or (Path(out_cfg["dir"]) if "dir" in out_cfg
                              else indir)
     outdir.mkdir(parents=True, exist_ok=True)
+
+    if args.refresh_heads:
+        for _, p in people_sel:
+            if p.nick:
+                head_cache_path(p.nick).unlink(missing_ok=True)
 
     if args.contact_sheet:
         contact_sheet([p for _, p in people_sel], layout,
@@ -1067,6 +1135,13 @@ def _main(args: argparse.Namespace) -> None:
                     "printed above (X is 0 for all; Y steps down per person). "
                     "Save it as an effect favourite to reapply in one click.")
         print(msg)
+
+    with _warn_lock:
+        pending_warnings = list(_warnings)
+    if pending_warnings:
+        print(f"\n{len(pending_warnings)} audio warning(s) from this run:")
+        for w in pending_warnings:
+            print(w)
 
 
 def main() -> None:

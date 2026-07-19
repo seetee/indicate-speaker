@@ -101,6 +101,7 @@ If `CONFIG.toml` is omitted the script looks for `indicate-speaker.toml` next to
 | `--discover` | off | Interactively pick each person's voice track; saves choices to config |
 | `--normalize` | off | Derive loudness thresholds per-person so quiet mics activate equally |
 | `--contact-sheet` | off | Write a PNG preview of all heads and exit |
+| `--refresh-heads` | off | Re-download avatar heads instead of using cached copies |
 | `--preview SECONDS` | off | Only process the first N seconds |
 | `--dry-run` | off | Analyse audio and report speaking time; render nothing |
 
@@ -181,7 +182,7 @@ norm_high_pct        = 90.0   # percentile of active frames mapped to full_db
 
 Any `[gate]` value can also be set inside a `[[person]]` section to override it for that person only — handy for one unusually quiet or loud mic.
 
-The script also warns when something looks wrong with the audio: when a person's loudness never reaches the gate (the head would stay dark for the whole episode), and when another stream — typically game audio — appears to bleed into the chosen voice track (checked by correlating the streams over a sample from the middle of the recording).
+The script also warns when something looks wrong with the audio: when a person's loudness never reaches the gate (the head would stay dark for the whole episode), and when another stream — typically game audio — appears to bleed into the chosen voice track (checked by correlating the streams over a sample from the middle of the recording). All warnings are repeated in a summary at the end of the run, so they are not lost between progress lines when rendering with `--jobs`.
 
 ### `[[person]]`
 
@@ -198,7 +199,7 @@ colour       = "#ff4da6"        # ring, glow, and corner accent colour
 # open_db    = -60.0           # any [gate] value can be overridden per person
 ```
 
-`nick` and `head_file` are mutually exclusive; at least one is required. Run `--discover` once after a new recording session if the audio track names have changed — it will find the right `stream_title` for each player and write it into the config.
+`nick` and `head_file` are mutually exclusive; at least one is required. Downloaded heads are cached in `~/.cache/indicate-speaker/`, so renders work offline after the first fetch; pass `--refresh-heads` after someone changes their skin. Run `--discover` once after a new recording session if the audio track names have changed — it will find the right `stream_title` for each player and write it into the config.
 
 ---
 
