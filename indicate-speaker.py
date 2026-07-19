@@ -228,7 +228,7 @@ class Gate:
     close_db: float = -46.0     # below this, forced toward silence
     spring_stiffness: float = 400.0     # k; higher = faster snap to speaking
     spring_damping_ratio: float = 0.65  # ζ; 1.0 = no overshoot, lower = bouncier
-    normalize: bool = False     # derive open/full thresholds per-person
+    normalize: bool | str = "auto"  # true / false / "auto" (only when needed)
     norm_low_pct: float = 15.0  # percentile of active frames → open_db
     norm_high_pct: float = 90.0 # percentile of active frames → full_db
 
@@ -357,40 +357,35 @@ class Envelope(NamedTuple):
     full_db: float
     close_db: float
     peak_db: float       # 99.5th-percentile loudness of the whole track
+    normalized: bool     # thresholds were derived from the track itself
 
 
-def activation_envelope(db: np.ndarray, fps: float, g: Gate) -> Envelope:
-    """Map loudness to a smooth 0..1 speaking activation.
+def _normalized_thresholds(db: np.ndarray, fps: float, g: Gate,
+                           peak_db: float) -> tuple[float, float, float] | None:
+    """Derive (open, full, close) from this track's own loudness distribution.
 
-    When normalize is on, all three thresholds — including the close/force-
-    silent cutoff — are derived from this person's own loudness distribution
-    rather than the config values, so a mic recorded 30 dB quieter than the
-    rest still animates. (An absolute close_db would zero out such a track
-    before the percentile statistics ever saw it.)
+    Speech has a bounded dynamic range: anything more than ~25 dB below this
+    track's loud speech (the peak) is not speech. Anchoring the speech/silence
+    cutoff to the peak — not the floor — keeps it sane for mics whose noise
+    gate turns silence into -180 dB digital zero. Returns None when the track
+    has too little contrast (near-empty or constant noise) or under a second
+    of detectable audio, so the caller keeps the config thresholds. If the
+    head reacts to near-silence, raise norm_low_pct in the config.
     """
-    open_db = g.open_db
-    full_db = g.full_db
-    close_db = g.close_db
-    peak_db = float(np.percentile(db, 99.5))
+    floor_db = float(np.percentile(db, 20))
+    if peak_db - floor_db <= 12.0:
+        return None
+    cut = max(peak_db - 25.0, floor_db + 6.0)
+    active = db[db > cut]
+    if len(active) < max(64, int(fps)):
+        return None
+    open_db = float(np.percentile(active, g.norm_low_pct))
+    full_db = float(np.percentile(active, g.norm_high_pct))
+    return open_db, full_db, min(cut, open_db - 2.0)
 
-    if g.normalize:
-        # Speech has a bounded dynamic range: anything more than ~25 dB below
-        # this track's loud speech (the peak) is not speech. Anchoring the
-        # speech/silence cutoff to the peak — not the floor — keeps it sane
-        # for mics whose noise gate turns silence into -180 dB digital zero.
-        # Falls back to the config thresholds when the track has too little
-        # contrast (near-empty or constant noise) to trust the statistics.
-        floor_db = float(np.percentile(db, 20))
-        if peak_db - floor_db > 12.0:
-            cut = max(peak_db - 25.0, floor_db + 6.0)
-            active = db[db > cut]
-            # Require at least one second of detectable audio. If the head
-            # reacts to near-silence, raise norm_low_pct in the config.
-            if len(active) >= max(64, int(fps)):
-                open_db = float(np.percentile(active, g.norm_low_pct))
-                full_db = float(np.percentile(active, g.norm_high_pct))
-                close_db = min(cut, open_db - 2.0)
 
+def _gated_spring(db: np.ndarray, fps: float, g: Gate, open_db: float,
+                  full_db: float, close_db: float) -> np.ndarray:
     span = max(1e-6, full_db - open_db)
     raw = np.clip((db - open_db) / span, 0.0, 1.0)
     raw[db < close_db] = 0.0
@@ -408,7 +403,48 @@ def activation_envelope(db: np.ndarray, fps: float, g: Gate) -> Envelope:
         v += (g.spring_stiffness * (target - x) - c * v) * dt
         x += v * dt
         out[i] = max(0.0, x)
-    return Envelope(out, open_db, full_db, close_db, peak_db)
+    return out
+
+
+def _gate_failed(env: np.ndarray, fps: float, open_db: float,
+                 peak_db: float) -> bool:
+    """True when the fixed thresholds clearly fail this track: the gate can
+    never open, or almost no speech registered on a long recording. Mirrors
+    the _warn_weak_signal heuristics."""
+    if peak_db < open_db:
+        return True
+    duration = len(env) / fps
+    speaking_s = float((env > 0.15).sum()) / fps
+    return duration >= 120.0 and speaking_s < max(5.0, 0.002 * duration)
+
+
+def activation_envelope(db: np.ndarray, fps: float, g: Gate) -> Envelope:
+    """Map loudness to a smooth 0..1 speaking activation.
+
+    normalize=true derives all three thresholds — including the close/force-
+    silent cutoff — from this person's own loudness distribution rather than
+    the config values, so a mic recorded 30 dB quieter than the rest still
+    animates. normalize="auto" (the default) uses the config thresholds and
+    switches to the derived ones only for tracks where the fixed gate clearly
+    fails, so a well-levelled mic keeps its tuned absolute behaviour.
+    """
+    peak_db = float(np.percentile(db, 99.5))
+    thresholds = (g.open_db, g.full_db, g.close_db)
+    normalized = False
+
+    if g.normalize is True:
+        derived = _normalized_thresholds(db, fps, g, peak_db)
+        if derived is not None:
+            thresholds, normalized = derived, True
+    env = _gated_spring(db, fps, g, *thresholds)
+
+    if g.normalize == "auto" and _gate_failed(env, fps, thresholds[0], peak_db):
+        derived = _normalized_thresholds(db, fps, g, peak_db)
+        if derived is not None:
+            thresholds, normalized = derived, True
+            env = _gated_spring(db, fps, g, *thresholds)
+
+    return Envelope(env, *thresholds, peak_db, normalized)
 
 
 def speaking_envelope(person: Person, stream_index: int, layout: Layout,
@@ -677,8 +713,9 @@ def _print_summary(person: Person, duration: float, speaking_s: float,
                    gate: Gate | None = None,
                    res: Envelope | None = None) -> None:
     norm_note = ""
-    if gate is not None and gate.normalize and res is not None:
-        norm_note = (f" [normalised open={res.open_db:.0f}"
+    if res is not None and res.normalized:
+        auto = "auto-" if gate is not None and gate.normalize == "auto" else ""
+        norm_note = (f" [{auto}normalised open={res.open_db:.0f}"
                      f"  full={res.full_db:.0f}"
                      f"  close={res.close_db:.0f} dB]")
     line = (f"  {person.name}: {duration:.1f}s, "
@@ -691,17 +728,20 @@ def _warn_weak_signal(person: Person, duration: float, speaking_s: float,
                       res: Envelope) -> None:
     """Say so, loudly, when the gate can never (or almost never) open."""
     if res.peak_db < res.open_db:
+        hint = ("even the track's own statistics found no usable speech — "
+                "check the recording"
+                if res.normalized else
+                "for this file use --normalize or set open_db/full_db/"
+                "close_db in this person's [[person]] section")
         warn(f"  {person.name}: WARNING: loudness peaks around "
              f"{res.peak_db:.0f} dB but the gate only opens above "
              f"{res.open_db:.0f} dB — the head will never light up. Raise "
-             f"the mic gain in OBS for future sessions; for this file use "
-             f"--normalize or set open_db/full_db/close_db in this person's "
-             f"[[person]] section.")
+             f"the mic gain in OBS for future sessions; {hint}.")
     elif duration >= 120.0 and speaking_s < max(5.0, 0.002 * duration):
+        hint = "" if res.normalized else " (try --normalize)"
         warn(f"  {person.name}: warning: only {speaking_s:.0f}s of speech "
              f"detected in {_fmt_dur(duration)} — if they talked more than "
-             f"that, the gate thresholds are too high for this mic "
-             f"(try --normalize).")
+             f"that, the gate thresholds are too high for this mic{hint}.")
 
 
 def render_overlay(person: Person, idx: int, layout: Layout, gate: Gate,
@@ -818,6 +858,9 @@ def load_config(path: Path) -> tuple[Layout, Gate, list[Person], dict]:
             setattr(layout, k, v)
     gate = Gate(**{k: v for k, v in cfg.get("gate", {}).items()
                    if k in Gate.__dataclass_fields__})
+    if gate.normalize not in (True, False, "auto"):
+        die(f'[gate] normalize must be true, false or "auto" '
+            f'(got {gate.normalize!r})')
     base = path.parent
     people: list[Person] = []
     for pc in cfg.get("person", []):
@@ -833,6 +876,12 @@ def load_config(path: Path) -> tuple[Layout, Gate, list[Person], dict]:
         hf = pc.get("head_file")
         if hf and not Path(hf).is_absolute():
             hf = base / hf
+        # any [gate] key can be overridden inside a [[person]] section
+        pgate = replace(gate, **{k: pc[k] for k in Gate.__dataclass_fields__
+                                 if k in pc})
+        if pgate.normalize not in (True, False, "auto"):
+            die(f'{pc["name"]}: normalize must be true, false or "auto" '
+                f'(got {pgate.normalize!r})')
         people.append(Person(
             name=pc["name"],
             colour=hex_to_rgb(pc.get("colour", "#33c1ff")),
@@ -843,14 +892,75 @@ def load_config(path: Path) -> tuple[Layout, Gate, list[Person], dict]:
             stream_title=pc.get("stream_title",
                                 cfg.get("project", {}).get(
                                     "stream_title", "Voice audio")),
-            # any [gate] key can be overridden inside a [[person]] section
-            gate=replace(gate, **{k: pc[k]
-                                  for k in Gate.__dataclass_fields__
-                                  if k in pc}),
+            gate=pgate,
         ))
     if not people:
         die("config defines no [[person]] sections")
     return layout, gate, people, cfg
+
+
+def find_episode_dir(indir: Path, people: list[Person],
+                     date: str | None) -> Path:
+    """Resolve the episode folder: `indir` itself when it already holds the
+    MKVs, otherwise the newest complete episode found up to two levels below
+    it (so the config can point at an episodes root like
+    .../sessions/session_NN_DATE/sources/ and a plain run just works)."""
+    if not indir.is_dir():
+        die(f"input directory not found: {indir}")
+    suffixes = {p.suffix for p in people if p.source is None and p.suffix}
+    if not suffixes:
+        return indir
+    if any(any(indir.glob(f"*_{s}.mkv")) for s in suffixes):
+        return indir     # an episode folder was given directly
+
+    episodes: dict[tuple[str, Path], set[str]] = {}
+    for pattern in ("*/*.mkv", "*/*/*.mkv"):
+        for f in indir.glob(pattern):
+            m = re.match(r"(\d{4}-\d{2}-\d{2})_(.+)\.mkv$", f.name)
+            if m and m.group(2) in suffixes:
+                episodes.setdefault((m.group(1), f.parent),
+                                    set()).add(m.group(2))
+    complete = {k for k, v in episodes.items() if v == suffixes}
+    if not complete:
+        pat = ", ".join(f"*_{s}.mkv" for s in sorted(suffixes))
+        die(f"no complete episode found in {indir} or up to two levels "
+            f"below it (need {pat} together in one folder). Pass --indir "
+            f"with the episode's folder.")
+    if date:
+        dirs = sorted(d for dt, d in complete if dt == date)
+        if not dirs:
+            dates = ", ".join(sorted({dt for dt, _ in complete}))
+            die(f"no episode dated {date} under {indir}; found: {dates}")
+    else:
+        date = max(dt for dt, _ in complete)
+        dirs = sorted(d for dt, d in complete if dt == date)
+    if len(dirs) > 1:
+        names = ", ".join(str(d) for d in dirs)
+        die(f"several folders hold an episode dated {date}: {names}. "
+            f"Pass --indir to choose one.")
+    print(f"Using episode: {dirs[0]}")
+    return dirs[0]
+
+
+def ask_episode_dir(indir: Path, people: list[Person],
+                    date: str | None) -> Path:
+    """find_episode_dir, but on failure ask for the sources folder instead of
+    giving up — the script is normally started inside an episode's sources/
+    directory, and a run from anywhere else should just prompt."""
+    while True:
+        try:
+            return find_episode_dir(indir, people, date)
+        except VoiceError as exc:
+            if not sys.stdin.isatty():
+                raise
+            print(exc)
+            try:
+                raw = input("Episode sources directory (blank to abort): ").strip()
+            except EOFError:
+                raw = ""
+            if not raw:
+                raise
+            indir = Path(raw).expanduser()
 
 
 def resolve_sources(people: list[Person], indir: Path,
@@ -972,7 +1082,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("config", type=Path, nargs="?", default=None,
                     help="TOML config file; defaults to indicate-speaker.toml "
                          "next to the script, or the only .toml in the current "
-                         "directory if there is exactly one")
+                         "directory if there is exactly one. A directory here "
+                         "is treated as --indir instead.")
     ap.add_argument("--person", action="append", default=[], metavar="NAME",
                     help="only process this person; repeatable")
     ap.add_argument("--canvas", choices=["full", "tight"], default=None,
@@ -980,12 +1091,13 @@ def parse_args() -> argparse.Namespace:
                          "smaller, position set once in Kdenlive. full: a "
                          "1920x1080 frame, drop straight on a track but bigger "
                          "and slower.")
-    ap.add_argument("--jobs", "-j", type=int, default=1, metavar="N",
-                    help="render N people in parallel (4 is sensible on a "
-                         "quad-core; default 1)")
+    ap.add_argument("--jobs", "-j", type=int, default=None, metavar="N",
+                    help="render N people in parallel (default: the config's "
+                         "[output] jobs, else 1; use 1 on slow spinning disks)")
     ap.add_argument("--indir", type=Path, default=None, metavar="DIR",
                     help="folder holding the episode's MKVs, found by suffix "
-                         "(default: the config file's folder)")
+                         "(default: the current directory; prompts if no "
+                         "episode is found there)")
     ap.add_argument("--date", default=None, metavar="YYYY-MM-DD",
                     help="only needed if one folder holds several episodes")
     ap.add_argument("--outdir", "-o", type=Path, default=None, metavar="DIR",
@@ -999,9 +1111,9 @@ def parse_args() -> argparse.Namespace:
                          "pick the voice track; optionally saves choices to "
                          "the config, then proceeds with the render")
     ap.add_argument("--normalize", action="store_true", default=False,
-                    help="derive open/full thresholds per person from their "
-                         "own loudness distribution so quiet mics activate "
-                         "the indicator as strongly as loud ones")
+                    help="force per-person thresholds for everyone (by "
+                         "default, normalize=\"auto\" applies them only to "
+                         "tracks where the configured gate clearly fails)")
     ap.add_argument("--refresh-heads", action="store_true",
                     help="re-download avatar heads instead of using the "
                          "cached copies (use after someone changes their skin)")
@@ -1027,6 +1139,11 @@ def _find_config() -> Path:
 
 
 def _main(args: argparse.Namespace) -> None:
+    if args.config is not None and args.config.is_dir():
+        # a directory as the positional argument means --indir
+        if args.indir is None:
+            args.indir = args.config
+        args.config = None
     if args.config is None:
         args.config = _find_config()
     if not args.config.is_file():
@@ -1051,11 +1168,9 @@ def _main(args: argparse.Namespace) -> None:
 
     canvas = args.canvas or out_cfg.get("canvas", "tight")
     indir = (args.indir or (Path(in_cfg["dir"]) if "dir" in in_cfg
-                            else args.config.parent))
+                            else Path.cwd()))
     date = args.date or in_cfg.get("date")
-    outdir = args.outdir or (Path(out_cfg["dir"]) if "dir" in out_cfg
-                             else indir)
-    outdir.mkdir(parents=True, exist_ok=True)
+    jobs = args.jobs if args.jobs is not None else int(out_cfg.get("jobs", 1))
 
     if args.refresh_heads:
         for _, p in people_sel:
@@ -1063,6 +1178,9 @@ def _main(args: argparse.Namespace) -> None:
                 head_cache_path(p.nick).unlink(missing_ok=True)
 
     if args.contact_sheet:
+        outdir = (args.outdir or (Path(out_cfg["dir"]) if "dir" in out_cfg
+                                  else args.config.parent))
+        outdir.mkdir(parents=True, exist_ok=True)
         contact_sheet([p for _, p in people_sel], layout,
                       outdir / "indicate-speaker_preview.png")
         return
@@ -1071,7 +1189,12 @@ def _main(args: argparse.Namespace) -> None:
         if shutil.which(tool) is None:
             die(f"{tool} not found on PATH. Install FFmpeg (it provides both).")
 
+    indir = ask_episode_dir(indir, [p for _, p in people_sel], date)
     resolve_sources([p for _, p in people_sel], indir, date)
+
+    outdir = args.outdir or (Path(out_cfg["dir"]) if "dir" in out_cfg
+                             else indir)
+    outdir.mkdir(parents=True, exist_ok=True)
 
     if args.discover:
         if not sys.stdin.isatty():
@@ -1092,9 +1215,9 @@ def _main(args: argparse.Namespace) -> None:
 
     print(f"indicate-speaker: {layout.width}x{layout.height} @ "
           f"{layout.fps:g} fps, {len(people_sel)} overlay(s), "
-          f"canvas={canvas}, jobs={args.jobs}")
+          f"canvas={canvas}, jobs={jobs}")
 
-    single = args.jobs <= 1 or len(people_sel) <= 1
+    single = jobs <= 1 or len(people_sel) <= 1
     live = single and sys.stdout.isatty()
     abort = threading.Event()
 
@@ -1110,7 +1233,7 @@ def _main(args: argparse.Namespace) -> None:
 
     if not single:
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
             futs = [pool.submit(job, it) for it in people_sel]
             try:
                 for fut in as_completed(futs):

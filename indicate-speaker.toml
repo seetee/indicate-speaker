@@ -1,15 +1,18 @@
 # indicate-speaker.toml — config for the let's-play crew.
 #
-# Put the episode's four MKVs in one folder and run:
+# The common case: cd into the episode's sources/ folder and run
+#   python3 /path/to/indicate-speaker.py
+# — all four render in parallel, quiet mics are handled automatically. Run
+# anywhere else and the script asks for the sources directory (or point it
+# there with --indir / a folder as the first argument).
+#
 #   python3 indicate-speaker.py --contact-sheet            # preview the look
-#   python3 indicate-speaker.py --indir /path/to/episode --jobs 4
+#   python3 indicate-speaker.py --discover                 # re-identify tracks
 #
-# First time with a new recording setup, run --discover to identify tracks:
-#   python3 indicate-speaker.py --discover --indir /path/to/episode
-#
-# Source files are found automatically by suffix: a person with suffix "k"
-# matches  YYYY-MM-DD_k.mkv  in --indir (the date is detected for you). If a
-# folder holds more than one episode, add  --date 2026-06-13  to disambiguate.
+# Source files are found by suffix: a person with suffix "k" matches
+# YYYY-MM-DD_k.mkv, either directly in the input folder or in a complete
+# episode folder up to two levels below it (newest episode wins; pin one
+# with --date 2026-06-13).
 
 [project]
 width  = 1920
@@ -18,8 +21,11 @@ fps    = 60
 stream_title = "Track2"   # the audio stream title read from each MKV
 
 [input]
-# dir  = "/path/to/episode"    # or pass --indir on the command line
-# date = "2026-06-13"          # or pass --date; omit to auto-detect by suffix
+# dir  = "/path/to/episode"    # default: the directory the script is run from
+# date = "2026-06-13"          # pin one episode; omit to use the newest
+
+[output]
+jobs = 4   # render all four in parallel; use  -j 1  on the slow archive disk
 
 # --- Optional fine-tuning. Delete any line to use the default shown. ---
 [layout]
@@ -40,10 +46,11 @@ full_db              = -16.0  # envelope hits 100% at/above this
 close_db             = -46.0  # below this, forced to silent (room tone, breaths)
 spring_stiffness     = 400.0  # k; higher = snappier snap-to-speaking
 spring_damping_ratio = 0.65   # ζ; 1.0 = no overshoot, 0.4 = noticeably bouncy
-# normalize = true     # derive open/full/close per person from their own
-                       # levels (equal visual activation regardless of mic
-                       # volume, even for a mic recorded far too quietly)
-                       # can also be set with --normalize on the command line
+# normalize = "auto"   # "auto" (default): tracks that the thresholds above
+                       # clearly fail (far-too-quiet mics) automatically get
+                       # per-person thresholds derived from their own levels;
+                       # true = always derive, false = never.
+                       # --normalize on the command line forces true.
 # norm_low_pct  = 15.0 # percentile of active frames used as open_db
 # norm_high_pct = 90.0 # percentile of active frames used as full_db
 

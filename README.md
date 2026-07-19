@@ -20,7 +20,7 @@ Output is one transparent `.mov` overlay per person. Drop them above your footag
 - **Multi-layer bloom** — three concentric glow layers (tight core → mid halo → wide ambient) give a luminous, backlit look
 - **Corner accents** — L-shaped bracket marks frame the head while speaking, HUD-style
 - **Idle breathing** — a slow sinusoidal pulse keeps the indicator visually alive when someone is quiet
-- **Per-person normalisation** (`--normalize`) — equalises activation across mismatched mic levels so a quiet mic lights up as strongly as a loud one
+- **Adaptive per-person normalisation** — mics recorded far too quietly are detected automatically and get thresholds derived from their own levels, so they light up as strongly as loud ones (`normalize = "auto"`, the default; `--normalize` forces it for everyone)
 - **Interactive track discovery** (`--discover`) — lists the audio streams in each MKV and saves your choices back to the config
 - **Tight canvas** (default) — encodes only the sprite, ~24× faster and ~3× smaller than a full 1920×1080 frame; position is set once in Kdenlive and saved as an effect favourite
 - **Parallel rendering** (`--jobs N`) — processes all players simultaneously on multi-core machines
@@ -60,46 +60,50 @@ No build step, no package to install — it is a single script.
 ## Quick start
 
 ```bash
+# The common case: run from inside the episode's sources folder — everyone
+# renders in parallel, quiet mics are handled automatically
+cd /path/to/episode/sources && python3 /path/to/indicate-speaker.py
+
+# Or pass an episode folder (or a root holding several) as the argument
+python3 indicate-speaker.py /path/to/episode
+
 # Preview the look of all heads (no MKV files needed)
 python3 indicate-speaker.py --contact-sheet
 
 # First time with a new recording setup: identify voice tracks interactively
-python3 indicate-speaker.py --discover --indir /path/to/episode
-
-# Full render, all four players in parallel
-python3 indicate-speaker.py --indir /path/to/episode --jobs 4
+python3 indicate-speaker.py --discover
 
 # Check audio analysis without rendering anything
-python3 indicate-speaker.py --indir /path/to/episode --dry-run
+python3 indicate-speaker.py --dry-run
 
 # Render only the first 30 seconds for a quick look
-python3 indicate-speaker.py --indir /path/to/episode --preview 30
+python3 indicate-speaker.py --preview 30
 ```
 
-The config file (`indicate-speaker.toml`) is found automatically when it lives next to the script, so you do not need to pass it on the command line.
+The config file (`indicate-speaker.toml`) is found automatically when it lives next to the script, so you do not need to pass it on the command line. The episode is taken from the current directory: when that folder does not itself contain the MKVs, the script searches up to two levels below it (e.g. `session_NN_DATE/sources/`) and uses the newest complete episode, printing which one it chose — and when nothing is found at all, it simply asks for the sources directory.
 
 ---
 
 ## Usage
 
 ```
-python3 indicate-speaker.py [CONFIG.toml] [options]
+python3 indicate-speaker.py [CONFIG.toml | EPISODE_DIR] [options]
 ```
 
-If `CONFIG.toml` is omitted the script looks for `indicate-speaker.toml` next to itself, then for the only `.toml` file in the current directory.
+If `CONFIG.toml` is omitted the script looks for `indicate-speaker.toml` next to itself, then for the only `.toml` file in the current directory. Passing a **directory** as the positional argument is shorthand for `--indir`.
 
 ### Options
 
 | Flag | Default | Description |
 |---|---|---|
-| `--indir DIR` | config's folder | Folder containing the episode's MKV files |
-| `--outdir DIR` | same as `--indir` | Where to write the overlay `.mov` files |
-| `--date YYYY-MM-DD` | auto-detect | Disambiguate when a folder holds multiple episodes |
-| `--jobs N` / `-j N` | `1` | Render N players in parallel |
+| `--indir DIR` | current directory | Folder with the episode's MKVs, or a root holding several — the newest complete episode up to two levels below is used; prompts when nothing is found |
+| `--outdir DIR` | the episode folder | Where to write the overlay `.mov` files |
+| `--date YYYY-MM-DD` | newest | Pick a specific episode when the folder holds several |
+| `--jobs N` / `-j N` | config's `jobs`, else `1` | Render N players in parallel |
 | `--canvas tight\|full` | `tight` | `tight`: sprite only (fast, small). `full`: 1920×1080 frame (drop straight on track) |
 | `--person NAME` | all | Only process this person; repeatable |
 | `--discover` | off | Interactively pick each person's voice track; saves choices to config |
-| `--normalize` | off | Derive loudness thresholds per-person so quiet mics activate equally |
+| `--normalize` | auto | Force per-person thresholds for everyone (by default they apply automatically only to tracks the configured gate clearly fails) |
 | `--contact-sheet` | off | Write a PNG preview of all heads and exit |
 | `--refresh-heads` | off | Re-download avatar heads instead of using cached copies |
 | `--preview SECONDS` | off | Only process the first N seconds |
@@ -109,7 +113,7 @@ If `CONFIG.toml` is omitted the script looks for `indicate-speaker.toml` next to
 
 Each MKV must be named `YYYY-MM-DD_<suffix>.mkv`, where `<suffix>` matches the `suffix` field in the config. For example, a config with `suffix = "k"` and `--date 2026-06-27` looks for `2026-06-27_k.mkv`.
 
-If the folder contains exactly one episode (one file per suffix), `--date` can be omitted.
+If the folder contains exactly one episode (one file per suffix), `--date` can be omitted. If `--indir` points at a root rather than an episode folder, the newest complete episode found up to two levels below it is used; `--date` picks an older one.
 
 ### Kdenlive workflow
 
@@ -140,8 +144,18 @@ stream_title = "Voice audio"   # audio stream title to use for all players
 
 ```toml
 [input]
-dir  = "/path/to/episode"   # equivalent to --indir
-date = "2026-06-27"         # equivalent to --date
+dir  = "/path/to/episode"   # equivalent to --indir (default: the directory
+                            # the script is run from)
+date = "2026-06-27"         # equivalent to --date; omit to use the newest
+```
+
+### `[output]`
+
+```toml
+[output]
+dir    = "/path/to/out"   # equivalent to --outdir (default: the episode folder)
+canvas = "tight"          # equivalent to --canvas
+jobs   = 4                # equivalent to --jobs (default: 1)
 ```
 
 ### `[layout]`
@@ -173,12 +187,12 @@ full_db              = -16.0  # activation hits 1.0 at/above this dBFS
 close_db             = -46.0  # below this, forced to silence (ignores room tone)
 spring_stiffness     = 400.0  # k; higher = faster snap to speaking
 spring_damping_ratio = 0.65   # ζ; 1.0 = no overshoot, 0.4 = noticeably bouncy
-normalize            = false  # true = derive open/full/close per-person from their track
+normalize            = "auto" # "auto" | true | false — see below
 norm_low_pct         = 15.0   # percentile of active frames mapped to open_db
 norm_high_pct        = 90.0   # percentile of active frames mapped to full_db
 ```
 
-**`normalize`** is useful when players have significantly different mic levels: it measures each person's own loudness distribution (noise floor and speech peak) and derives all three thresholds from it, so a quieter mic lights up the indicator just as strongly as a loud one — even a mic recorded tens of dB below the configured thresholds. Can also be enabled per-run with `--normalize`.
+**`normalize`** handles players with significantly different mic levels: it measures a person's own loudness distribution (noise floor and speech peak) and derives all three thresholds from it, so a quieter mic lights up the indicator just as strongly as a loud one — even a mic recorded tens of dB below the configured thresholds. The default `"auto"` applies this only to tracks the configured thresholds clearly fail (the head would stay dark, or nearly so, for the whole episode) — well-levelled mics keep the predictable absolute thresholds, and whoever's mic happens to be too quiet this session is caught automatically. `true` derives thresholds for everyone (also forceable per-run with `--normalize`); `false` disables it.
 
 Any `[gate]` value can also be set inside a `[[person]]` section to override it for that person only — handy for one unusually quiet or loud mic.
 
