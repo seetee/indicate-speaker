@@ -200,6 +200,26 @@ def test_normalize_true_and_false_are_unconditional() -> None:
 
 
 # --------------------------------------------------------------------------
+# envelope plot
+# --------------------------------------------------------------------------
+
+def test_plot_envelope_writes_png() -> None:
+    from PIL import Image
+    fps, n = 60.0, 6000
+    rng = np.random.default_rng(7)
+    db = np.clip(rng.normal(-50, 15, n), -80, 0)
+    env = np.clip(rng.random(n), 0, 1)
+    res = M.Envelope(env, -38.0, -16.0, -46.0, -20.0, True, db)
+    person = M.Person(name="Test", colour=(255, 77, 166), suffix="t")
+    with tempfile.TemporaryDirectory() as td:
+        png = Path(td) / "test_envelope.png"
+        M.plot_envelope(person, res, fps, png)
+        img = Image.open(png)
+        assert img.size == (1600, 260)
+        assert img.getpixel((0, 0)) == (24, 25, 28)   # background painted
+
+
+# --------------------------------------------------------------------------
 # audio decoding
 # --------------------------------------------------------------------------
 

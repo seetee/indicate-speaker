@@ -381,6 +381,7 @@ class Envelope(NamedTuple):
     close_db: float
     peak_db: float       # 99.5th-percentile loudness of the whole track
     normalized: bool     # thresholds were derived from the track itself
+    db: np.ndarray       # per-frame raw loudness, kept for --plot
 
 
 def _normalized_thresholds(db: np.ndarray, fps: float, g: Gate,
@@ -467,7 +468,7 @@ def activation_envelope(db: np.ndarray, fps: float, g: Gate) -> Envelope:
             thresholds, normalized = derived, True
             env = _gated_spring(db, fps, g, *thresholds)
 
-    return Envelope(env, *thresholds, peak_db, normalized)
+    return Envelope(env, *thresholds, peak_db, normalized, db)
 
 
 def speaking_envelope(person: Person, stream_index: int, layout: Layout,
@@ -717,6 +718,80 @@ def contact_sheet(people: list[Person], layout: Layout, out: Path) -> None:
     print(f"Contact sheet written: {out}")
 
 
+def _tick_step(duration_s: float) -> float:
+    """Largest step from a pleasant set that yields at most ~14 ticks."""
+    for step in (10, 30, 60, 300, 600, 1800, 3600, 7200):
+        if duration_s / step <= 14:
+            return float(step)
+    return 14400.0
+
+
+def plot_envelope(person: Person, res: Envelope, fps: float,
+                  out_png: Path) -> None:
+    """Timeline PNG: loudness band, gate thresholds, speaking activation.
+
+    Makes threshold tuning visible: the head lights up exactly where the
+    coloured activation area rises, and the dashed lines show where the
+    gate sat for this track (after any normalisation).
+    """
+    W, H = 1600, 260
+    ml, mr, mt, mb = 56, 14, 30, 24
+    pw, ph = W - ml - mr, H - mt - mb
+    DB_MIN, DB_MAX = -80.0, 0.0
+    img = Image.new("RGB", (W, H), (24, 25, 28))
+    d = ImageDraw.Draw(img, "RGBA")
+    try:
+        font = ImageFont.load_default(size=12)
+    except TypeError:      # Pillow < 10.1
+        font = ImageFont.load_default()
+
+    def ydb(v: float) -> float:
+        return mt + ph * (DB_MAX - min(DB_MAX, max(DB_MIN, v))) / (DB_MAX - DB_MIN)
+
+    n = len(res.db)
+    db = np.clip(res.db, DB_MIN, DB_MAX)
+    env = np.clip(res.env, 0.0, 1.0)
+    cols = np.linspace(0, n, pw + 1).astype(int)
+    r, g, b = person.colour
+
+    for x in range(pw):
+        lo, hi = cols[x], max(cols[x] + 1, cols[x + 1])
+        # activation: translucent filled column in the person's colour
+        y_act = mt + ph * (1.0 - float(env[lo:hi].max()))
+        d.line([(ml + x, mt + ph), (ml + x, y_act)], fill=(r, g, b, 88))
+        # loudness: per-column min..max band
+        seg = db[lo:hi]
+        d.line([(ml + x, ydb(float(seg.max()))),
+                (ml + x, ydb(float(seg.min())))], fill=(126, 128, 134, 200))
+
+    for val, name in ((res.full_db, "full"), (res.open_db, "open"),
+                      (res.close_db, "close")):
+        y = ydb(val)
+        for x0 in range(ml, ml + pw, 10):
+            d.line([(x0, y), (x0 + 5, y)], fill=(242, 201, 76, 220))
+        d.text((ml + pw - 96, y - 15), f"{name} {val:.0f} dB",
+               fill=(242, 201, 76, 255), font=font)
+
+    for v in range(0, int(DB_MIN) - 1, -20):
+        d.text((8, ydb(v) - 6), f"{v:4d}", fill=(168, 168, 168), font=font)
+    duration = n / fps
+    t, step = 0.0, _tick_step(duration)
+    while t <= duration:
+        x = ml + pw * t / max(duration, 1e-9)
+        d.line([(x, mt + ph), (x, mt + ph + 4)], fill=(168, 168, 168))
+        d.text((x - 12, mt + ph + 7), _fmt_dur(t),
+               fill=(168, 168, 168), font=font)
+        t += step
+
+    speaking_min = float((res.env > 0.15).sum()) / fps / 60.0
+    # ASCII only: Pillow's default font has no glyph for em-dash and friends
+    title = (f"{person.name}: {_fmt_dur(duration)}, "
+             f"~{speaking_min:.1f} min speaking"
+             + ("   [auto-normalised thresholds]" if res.normalized else ""))
+    d.text((ml, 8), title, fill=(232, 232, 232), font=font)
+    img.save(out_png)
+
+
 # --------------------------------------------------------------------------
 # Render one person's overlay
 # --------------------------------------------------------------------------
@@ -781,6 +856,7 @@ def _warn_weak_signal(person: Person, duration: float, speaking_s: float,
 def render_overlay(person: Person, idx: int, layout: Layout, gate: Gate,
                    out_path: Path, canvas: str, codec: str,
                    preview_s: float | None, dry_run: bool, live: bool = True,
+                   plot: bool = False,
                    abort: threading.Event | None = None) -> None:
     aidx = find_audio_index(person.source, person.stream_title)
     full_duration = media_duration(person.source)
@@ -795,6 +871,13 @@ def render_overlay(person: Person, idx: int, layout: Layout, gate: Gate,
     if preview_s is None:
         check_track_bleed(person, aidx, full_duration)
 
+    def maybe_plot(res: Envelope) -> None:
+        if plot:
+            png = out_path.with_name(f"{person.name.lower()}_envelope.png")
+            plot_envelope(person, res, layout.fps, png)
+            print(f"  {person.name}: envelope plot  ->  {png.name}",
+                  flush=True)
+
     if dry_run:
         res = speaking_envelope(
             person, aidx, layout, gate, n_frames, live,
@@ -803,6 +886,7 @@ def render_overlay(person: Person, idx: int, layout: Layout, gate: Gate,
         _print_summary(person, duration, speaking_s, aidx, note, live,
                        gate, res)
         _warn_weak_signal(person, duration, speaking_s, res)
+        maybe_plot(res)
         return
 
     # fetch the head first so a network or avatar problem fails in seconds,
@@ -820,6 +904,7 @@ def render_overlay(person: Person, idx: int, layout: Layout, gate: Gate,
         _print_summary(person, duration, speaking_s, aidx, note, live,
                        gate, res)
         _warn_weak_signal(person, duration, speaking_s, res)
+        maybe_plot(res)
 
         levels = np.clip((env * (LEVELS - 1)).round().astype(np.int64),
                          0, LEVELS - 1)
@@ -1179,6 +1264,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--refresh-heads", action="store_true",
                     help="re-download avatar heads instead of using the "
                          "cached copies (use after someone changes their skin)")
+    ap.add_argument("--plot", action="store_true",
+                    help="write a per-person envelope timeline PNG (loudness, "
+                         "thresholds, speaking activation) next to the "
+                         "overlays — makes gate tuning visible")
     ap.add_argument("--dry-run", action="store_true",
                     help="analyse audio and report, render nothing")
     ap.add_argument("--version", action="version",
@@ -1297,7 +1386,7 @@ def _main(args: argparse.Namespace) -> None:
         try:
             render_overlay(person, idx, layout, person.gate or gate, out_path,
                            canvas, codec, args.preview, args.dry_run, live,
-                           abort)
+                           args.plot, abort)
         except BaseException:
             abort.set()      # tell sibling jobs to stop promptly
             raise
