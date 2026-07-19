@@ -200,6 +200,48 @@ def test_normalize_true_and_false_are_unconditional() -> None:
 
 
 # --------------------------------------------------------------------------
+# talk stats
+# --------------------------------------------------------------------------
+
+def test_speech_bursts_merges_and_filters() -> None:
+    fps = 10.0
+    env = np.zeros(300)             # 30 s at 10 fps
+    env[10:50] = 1.0                # 1.0s..5.0s   burst A
+    env[55:90] = 1.0                # 5.5s..9.0s   gap 0.5s -> merged into A
+    env[150:152] = 1.0              # 0.2s blip -> dropped
+    env[200:260] = 1.0              # 20.0s..26.0s burst B
+    bursts = M.speech_bursts(env, fps)
+    assert len(bursts) == 2, bursts
+    (a0, a1), (b0, b1) = bursts
+    assert abs(a0 - 1.0) < 0.2 and abs(a1 - 9.0) < 0.2, bursts
+    assert abs(b0 - 20.0) < 0.2 and abs(b1 - 26.0) < 0.2, bursts
+    assert M.speech_bursts(np.zeros(100), fps) == []
+
+
+def test_write_stats_report() -> None:
+    fps = 10.0
+    env_a = np.zeros(600)
+    env_a[0:300] = 1.0              # 30 s of speech
+    env_b = np.zeros(600)
+    env_b[400:500] = 1.0            # 10 s of speech
+    db = np.full(600, -30.0)
+    res_a = M.Envelope(env_a, -38.0, -16.0, -46.0, -20.0, False, db)
+    res_b = M.Envelope(env_b, -38.0, -16.0, -46.0, -20.0, False, db)
+    pa = M.Person(name="Alice", colour=(255, 0, 0), suffix="a")
+    pb = M.Person(name="Bob", colour=(0, 255, 0), suffix="b")
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td)
+        M.write_stats([(pa, res_a), (pb, res_b)], fps, out,
+                      out / "session_9" / "sources", offsets=None)
+        md = (out / "talk_stats.md").read_text()
+        csv = (out / "talk_stats.csv").read_text()
+    assert "# Talk stats: session_9" in md
+    assert "Most talkative: **Alice** (75% of all speech)" in md, md
+    assert "need recording offsets" in md
+    assert "Alice,60.0,30.0,0.500,0.750,1,30.0,30.0," in csv, csv
+
+
+# --------------------------------------------------------------------------
 # envelope plot
 # --------------------------------------------------------------------------
 

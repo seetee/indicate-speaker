@@ -27,6 +27,7 @@ Output is one transparent `.mov` overlay per person. Drop them above your footag
 - **Parallel rendering** (`--jobs N`) — processes all players simultaneously on multi-core machines
 - **Contact sheet** (`--contact-sheet`) — renders a quiet-vs-speaking PNG preview before you commit to a full encode
 - **Envelope plots** (`--plot`) — a per-person timeline PNG of loudness, gate thresholds, and speaking activation, so threshold tuning is something you can see instead of guess
+- **Talk stats** (`--stats`) — per-person talk time, talk share, and longest monologue as Markdown + CSV per episode
 
 ---
 
@@ -109,6 +110,7 @@ If `CONFIG.toml` is omitted the script looks for `indicate-speaker.toml` next to
 | `--normalize` | auto | Force per-person thresholds for everyone (by default they apply automatically only to tracks the configured gate clearly fails) |
 | `--contact-sheet` | off | Write a PNG preview of all heads and exit |
 | `--plot` | off | Write `<name>_envelope.png` timelines (loudness, thresholds, activation) next to the overlays |
+| `--stats` | off | Write `talk_stats.md`/`.csv` (talk time, share, longest monologue); combine with `--dry-run` to skip rendering |
 | `--refresh-heads` | off | Re-download avatar heads instead of using cached copies |
 | `--preview SECONDS` | off | Only process the first N seconds (also skips the slow track-bleed check) |
 | `--skip-existing` | off | Leave finished overlays alone — cheap retry after one person's render failed |

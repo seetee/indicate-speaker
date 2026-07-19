@@ -793,6 +793,121 @@ def plot_envelope(person: Person, res: Envelope, fps: float,
 
 
 # --------------------------------------------------------------------------
+# Talk statistics
+# --------------------------------------------------------------------------
+
+SPEAK_THRESH = 0.15        # activation above this counts as speaking
+
+
+def speech_bursts(env: np.ndarray, fps: float, merge_gap_s: float = 1.0,
+                  min_burst_s: float = 0.3) -> list[tuple[float, float]]:
+    """(start_s, end_s) speaking bursts: pauses shorter than merge_gap_s are
+    joined into one burst, blips shorter than min_burst_s are dropped."""
+    on = env > SPEAK_THRESH
+    if not on.any():
+        return []
+    edges = np.diff(on.astype(np.int8))
+    starts = [int(i) + 1 for i in (edges == 1).nonzero()[0]]
+    ends = [int(i) + 1 for i in (edges == -1).nonzero()[0]]
+    if on[0]:
+        starts.insert(0, 0)
+    if on[-1]:
+        ends.append(len(on))
+    merged: list[list[int]] = []
+    for s, e in zip(starts, ends):
+        if merged and s - merged[-1][1] < merge_gap_s * fps:
+            merged[-1][1] = e
+        else:
+            merged.append([s, e])
+    return [(s / fps, e / fps) for s, e in merged
+            if (e - s) / fps >= min_burst_s]
+
+
+def write_stats(results: list[tuple[Person, Envelope]], fps: float,
+                outdir: Path, episode: Path,
+                offsets: dict[str, float] | None) -> None:
+    """Write talk_stats.md and talk_stats.csv for the analysed people.
+
+    Cross-person numbers (overlaps, interruptions) need the recordings'
+    relative start offsets, which are only known when --sync succeeded;
+    without them the report sticks to per-person statistics.
+    """
+    rows = []
+    for person, res in results:
+        bursts = speech_bursts(res.env, fps)
+        speaking = sum(e - s for s, e in bursts)
+        longest = max(bursts, key=lambda b: b[1] - b[0], default=None)
+        rows.append({
+            "person": person, "bursts": bursts, "speaking": speaking,
+            "duration": len(res.env) / fps, "longest": longest,
+        })
+    total_speech = sum(r["speaking"] for r in rows) or 1e-9
+
+    interruptions: dict[str, int] = {}
+    if offsets is not None and len(rows) > 1:
+        # shift every burst onto the shared session clock, then count bursts
+        # that begin while somebody else is already speaking
+        shifted = {r["person"].name: [(s + offsets[r["person"].name],
+                                       e + offsets[r["person"].name])
+                                      for s, e in r["bursts"]] for r in rows}
+        for name, own in shifted.items():
+            others = [iv for n, ivs in shifted.items() if n != name
+                      for iv in ivs]
+            others.sort()
+            count = 0
+            for s, _ in own:
+                count += any(os <= s < oe for os, oe in others)
+            interruptions[name] = count
+
+    # a folder literally named "sources" says nothing; use the session name
+    ep_name = (episode.parent.name if episode.name.lower() == "sources"
+               and episode.parent.name else episode.name)
+    md = [f"# Talk stats: {ep_name}", ""]
+    header = "| Person | Speaking | Share of episode | Share of speech | Bursts | Longest | Average |"
+    if interruptions:
+        header = header[:-1] + " Interruptions |"
+    md += [header, "|" + "---|" * (header.count("|") - 1)]
+    csv = ["person,duration_s,speaking_s,share_of_episode,share_of_speech,"
+           "bursts,longest_s,average_s,interruptions"]
+    for r in rows:
+        name = r["person"].name
+        nb = len(r["bursts"])
+        avg = r["speaking"] / nb if nb else 0.0
+        lg = r["longest"][1] - r["longest"][0] if r["longest"] else 0.0
+        line = (f"| {name} | {_fmt_dur(r['speaking'])} "
+                f"| {100 * r['speaking'] / max(r['duration'], 1e-9):.0f}% "
+                f"| {100 * r['speaking'] / total_speech:.0f}% "
+                f"| {nb} | {_fmt_dur(lg)} | {avg:.1f}s |")
+        if interruptions:
+            line += f" {interruptions.get(name, 0)} |"
+        md.append(line)
+        csv.append(f"{name},{r['duration']:.1f},{r['speaking']:.1f},"
+                   f"{r['speaking'] / max(r['duration'], 1e-9):.3f},"
+                   f"{r['speaking'] / total_speech:.3f},{nb},{lg:.1f},"
+                   f"{avg:.1f},{interruptions.get(name, '')}")
+
+    md.append("")
+    top = max(rows, key=lambda r: r["speaking"], default=None)
+    if top and top["speaking"] > 0:
+        md.append(f"- Most talkative: **{top['person'].name}** "
+                  f"({100 * top['speaking'] / total_speech:.0f}% of all speech)")
+    mono = max((r for r in rows if r["longest"]),
+               key=lambda r: r["longest"][1] - r["longest"][0], default=None)
+    if mono:
+        s, e = mono["longest"]
+        md.append(f"- Longest monologue: **{mono['person'].name}**, "
+                  f"{_fmt_dur(e - s)} (starting at {_fmt_dur(s)} into "
+                  f"their recording)")
+    if offsets is None and len(rows) > 1:
+        md.append("- Cross-person stats (interruptions/overlap) need "
+                  "recording offsets: run with --sync on recordings that "
+                  "share a voice-chat track.")
+    (outdir / "talk_stats.md").write_text("\n".join(md) + "\n")
+    (outdir / "talk_stats.csv").write_text("\n".join(csv) + "\n")
+    print(f"Talk stats written: {outdir / 'talk_stats.md'} (+ .csv)")
+
+
+# --------------------------------------------------------------------------
 # Render one person's overlay
 # --------------------------------------------------------------------------
 
@@ -857,7 +972,7 @@ def render_overlay(person: Person, idx: int, layout: Layout, gate: Gate,
                    out_path: Path, canvas: str, codec: str,
                    preview_s: float | None, dry_run: bool, live: bool = True,
                    plot: bool = False,
-                   abort: threading.Event | None = None) -> None:
+                   abort: threading.Event | None = None) -> Envelope:
     aidx = find_audio_index(person.source, person.stream_title)
     full_duration = media_duration(person.source)
     duration = min(full_duration, preview_s) if preview_s else full_duration
@@ -887,7 +1002,7 @@ def render_overlay(person: Person, idx: int, layout: Layout, gate: Gate,
                        gate, res)
         _warn_weak_signal(person, duration, speaking_s, res)
         maybe_plot(res)
-        return
+        return res
 
     # fetch the head first so a network or avatar problem fails in seconds,
     # not after a full audio-analysis pass over the source
@@ -980,6 +1095,7 @@ def render_overlay(person: Person, idx: int, layout: Layout, gate: Gate,
 
     rp.finish(f"  {person.name}: rendered in {_fmt_dur(rp.elapsed())}"
               f"  ->  {out_path.name}")
+    return res
 
 
 # --------------------------------------------------------------------------
@@ -1264,6 +1380,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--refresh-heads", action="store_true",
                     help="re-download avatar heads instead of using the "
                          "cached copies (use after someone changes their skin)")
+    ap.add_argument("--stats", action="store_true",
+                    help="write talk_stats.md/.csv (per-person talk time, "
+                         "share, longest monologue) next to the overlays; "
+                         "combine with --dry-run to skip rendering")
     ap.add_argument("--plot", action="store_true",
                     help="write a per-person envelope timeline PNG (loudness, "
                          "thresholds, speaking activation) next to the "
@@ -1375,6 +1495,8 @@ def _main(args: argparse.Namespace) -> None:
     single = jobs <= 1 or len(people_sel) <= 1
     live = single and sys.stdout.isatty()
     abort = threading.Event()
+    results_lock = threading.Lock()
+    results: list[tuple[int, Person, Envelope]] = []
 
     def job(item: tuple[int, Person]) -> None:
         idx, person = item
@@ -1384,12 +1506,14 @@ def _main(args: argparse.Namespace) -> None:
                   flush=True)
             return
         try:
-            render_overlay(person, idx, layout, person.gate or gate, out_path,
-                           canvas, codec, args.preview, args.dry_run, live,
-                           args.plot, abort)
+            res = render_overlay(person, idx, layout, person.gate or gate,
+                                 out_path, canvas, codec, args.preview,
+                                 args.dry_run, live, args.plot, abort)
         except BaseException:
             abort.set()      # tell sibling jobs to stop promptly
             raise
+        with results_lock:
+            results.append((idx, person, res))
 
     if not single:
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1405,6 +1529,11 @@ def _main(args: argparse.Namespace) -> None:
     else:
         for it in people_sel:
             job(it)
+
+    if args.stats and results:
+        results.sort(key=lambda t: t[0])     # config (screen) order
+        write_stats([(p, r) for _, p, r in results], layout.fps,
+                    outdir, indir, offsets=None)
 
     if not args.dry_run:
         msg = ("Done. In Kdenlive: import the overlays, align each to its "
