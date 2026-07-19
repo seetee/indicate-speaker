@@ -26,6 +26,7 @@ stream_title = "Track2"   # the audio stream title read from each MKV
 
 [output]
 jobs = 4   # render all four in parallel; use  -j 1  on the slow archive disk
+# codec = "qtrle"   # or "ffv1" (.mkv, half the size) / "utvideo" (.mkv, fast)
 
 # --- Optional fine-tuning. Delete any line to use the default shown. ---
 [layout]

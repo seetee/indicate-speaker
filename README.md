@@ -23,6 +23,7 @@ Output is one transparent `.mov` overlay per person. Drop them above your footag
 - **Adaptive per-person normalisation** — mics recorded far too quietly are detected automatically and get thresholds derived from their own levels, so they light up as strongly as loud ones (`normalize = "auto"`, the default; `--normalize` forces it for everyone)
 - **Interactive track discovery** (`--discover`) — lists the audio streams in each MKV and saves your choices back to the config
 - **Tight canvas** (default) — encodes only the sprite, ~24× faster and ~3× smaller than a full 1920×1080 frame; position is set once in Kdenlive and saved as an effect favourite
+- **Codec choice** (`--codec`) — qtrle/`.mov` by default; FOSS alternatives `ffv1` (`.mkv`, ~half the size, archival-grade) and `utvideo` (`.mkv`, fastest timeline scrubbing) — all lossless with alpha, all decoding byte-identically
 - **Parallel rendering** (`--jobs N`) — processes all players simultaneously on multi-core machines
 - **Contact sheet** (`--contact-sheet`) — renders a quiet-vs-speaking PNG preview before you commit to a full encode
 
@@ -101,6 +102,7 @@ If `CONFIG.toml` is omitted the script looks for `indicate-speaker.toml` next to
 | `--date YYYY-MM-DD` | newest | Pick a specific episode when the folder holds several |
 | `--jobs N` / `-j N` | config's `jobs`, else `1` | Render N players in parallel |
 | `--canvas tight\|full` | `tight` | `tight`: sprite only (fast, small). `full`: 1920×1080 frame (drop straight on track) |
+| `--codec qtrle\|ffv1\|utvideo` | `qtrle` | Overlay codec, all lossless with alpha: `qtrle` (`.mov`, most compatible), `ffv1` (`.mkv`, smallest), `utvideo` (`.mkv`, fastest scrubbing) |
 | `--person NAME` | all | Only process this person; repeatable |
 | `--discover` | off | Interactively pick each person's voice track; saves choices to config |
 | `--normalize` | auto | Force per-person thresholds for everyone (by default they apply automatically only to tracks the configured gate clearly fails) |
@@ -156,8 +158,11 @@ date = "2026-06-27"         # equivalent to --date; omit to use the newest
 [output]
 dir    = "/path/to/out"   # equivalent to --outdir (default: the episode folder)
 canvas = "tight"          # equivalent to --canvas
+codec  = "qtrle"          # equivalent to --codec: qtrle | ffv1 | utvideo
 jobs   = 4                # equivalent to --jobs (default: 1)
 ```
+
+All three codecs are lossless with alpha and decode to byte-identical frames; they differ in file size and how smoothly Kdenlive scrubs them. On a 60 s test render: `ffv1` ≈ half the size of `qtrle`, `utvideo` ≈ 10 % smaller and the fastest to encode and decode. The `.mkv` outputs carry the sync voice as FLAC instead of AAC (AAC's priming delay would shift the video by ~21 ms in Matroska).
 
 ### `[layout]`
 

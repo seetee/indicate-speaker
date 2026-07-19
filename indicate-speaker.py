@@ -42,10 +42,13 @@ the voice for waveform sync). Park them on tracks above the views and, if
 you like, drop them into a Sequence so they become one tidy, still-cuttable
 object that never moves.
 
-Output is QuickTime Animation (qtrle) in a .mov: lossless alpha that
-Kdenlive decodes reliably. (VP9/VP8 alpha WebM is smaller but its alpha is
-dropped on decode by the same FFmpeg backend Kdenlive uses, so it is not
-offered — it would import as a black box.)
+Output is QuickTime Animation (qtrle) in a .mov by default: lossless alpha
+that Kdenlive decodes reliably. --codec offers two FOSS alternatives, both
+lossless-with-alpha and decoding byte-identically to qtrle: ffv1 in .mkv
+(roughly half the size) and utvideo in .mkv (fastest timeline scrubbing).
+(VP9/VP8 alpha WebM is smaller still but its alpha is dropped on decode by
+the same FFmpeg backend Kdenlive uses, so it is not offered — it would
+import as a black box.)
 
 Two canvas modes:
   --canvas tight  (default) just the head sprite. ~24x faster and ~3x
@@ -102,6 +105,16 @@ _BLOOM_LAYERS = (          # (radius_factor, blur_factor, alpha_factor)
     (0.68, 0.16, 0.55),    # mid halo
     (0.85, 0.32, 0.28),    # wide soft ambient
 )
+
+# All three are lossless with alpha and decode byte-identically; they differ
+# in size and scrubbing speed. qtrle stays the default for compatibility.
+CODECS = {   # name -> (encoder args, encoder pix_fmt, container ext, muxer)
+    "qtrle":   (["-c:v", "qtrle"], "argb", ".mov", "mov"),
+    "ffv1":    (["-c:v", "ffv1", "-level", "3", "-slices", "4",
+                 "-slicecrc", "1"], "bgra", ".mkv", "matroska"),
+    "utvideo": (["-c:v", "utvideo", "-pred", "median"],
+                "gbrap", ".mkv", "matroska"),
+}
 
 
 # --------------------------------------------------------------------------
@@ -308,8 +321,12 @@ def frame_loudness_db(path: Path, stream_index: int, fps: float, n_frames: int,
             "-map", f"0:{stream_index}", "-ac", "1",
             "-ar", str(ANALYSIS_RATE), "-f", "s16le", "pipe:1"]
     if voice_out is not None:
-        cmd += ["-map", f"0:{stream_index}", "-ac", "1",
-                "-c:a", "aac", "-b:a", "128k", str(voice_out)]
+        # FLAC for .flac requests: unlike AAC it has no priming delay, which
+        # would otherwise make the matroska muxer shift the video by ~21 ms
+        acodec = (["-c:a", "flac"] if voice_out.suffix == ".flac"
+                  else ["-c:a", "aac", "-b:a", "128k"])
+        cmd += ["-map", f"0:{stream_index}", "-ac", "1", *acodec,
+                str(voice_out)]
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL)
@@ -704,8 +721,10 @@ def contact_sheet(people: list[Person], layout: Layout, out: Path) -> None:
 # Render one person's overlay
 # --------------------------------------------------------------------------
 
-def build_render_cmd(canvas: str, layout: Layout, x: int, y: int, s: int,
-                     voice: Path, out_path: Path, n_frames: int) -> list[str]:
+def build_render_cmd(canvas: str, codec: str, layout: Layout, x: int, y: int,
+                     s: int, voice: Path, out_path: Path,
+                     n_frames: int) -> list[str]:
+    codec_args, pix_fmt, _, muxer = CODECS[codec]
     base = ["ffmpeg", "-y",
             "-f", "rawvideo", "-pix_fmt", "rgba",
             "-s", f"{s}x{s}", "-r", str(layout.fps), "-i", "pipe:0",
@@ -714,12 +733,12 @@ def build_render_cmd(canvas: str, layout: Layout, x: int, y: int, s: int,
         vf = (f"color=c=0x00000000:s={layout.width}x{layout.height}:"
               f"r={layout.fps}[bg];"
               f"[bg][0:v]overlay=x={x}:y={y}:shortest=1[ov];"
-              f"[ov]format=argb[vout]")
+              f"[ov]format={pix_fmt}[vout]")
         cmd = [*base, "-filter_complex", vf, "-map", "[vout]", "-map", "1:a:0"]
     else:  # tight: encode the sprite stream as-is, position set in Kdenlive
-        cmd = [*base, "-map", "0:v", "-map", "1:a:0", "-pix_fmt", "argb"]
+        cmd = [*base, "-map", "0:v", "-map", "1:a:0", "-pix_fmt", pix_fmt]
     # the voice is already AAC, so copy it instead of re-encoding
-    return cmd + ["-c:v", "qtrle", "-c:a", "copy", "-f", "mov",
+    return cmd + [*codec_args, "-c:a", "copy", "-f", muxer,
                   "-frames:v", str(n_frames), str(out_path)]
 
 
@@ -760,8 +779,8 @@ def _warn_weak_signal(person: Person, duration: float, speaking_s: float,
 
 
 def render_overlay(person: Person, idx: int, layout: Layout, gate: Gate,
-                   out_path: Path, canvas: str, preview_s: float | None,
-                   dry_run: bool, live: bool = True,
+                   out_path: Path, canvas: str, codec: str,
+                   preview_s: float | None, dry_run: bool, live: bool = True,
                    abort: threading.Event | None = None) -> None:
     aidx = find_audio_index(person.source, person.stream_title)
     full_duration = media_duration(person.source)
@@ -791,7 +810,8 @@ def render_overlay(person: Person, idx: int, layout: Layout, gate: Gate,
     head = load_head(person)
 
     with tempfile.TemporaryDirectory(prefix="indspk_") as td:
-        voice = Path(td) / "voice.m4a"
+        voice = Path(td) / ("voice.m4a" if CODECS[codec][3] == "mov"
+                            else "voice.flac")
         res = speaking_envelope(
             person, aidx, layout, gate, n_frames, live,
             voice_out=voice, limit_s=preview_s, abort=abort)
@@ -809,7 +829,8 @@ def render_overlay(person: Person, idx: int, layout: Layout, gate: Gate,
         frame_cache: dict[tuple[int, int], bytes] = {}
         tmp_out = out_path.with_name(
             out_path.stem + ".partial" + out_path.suffix)
-        cmd = build_render_cmd(canvas, layout, x, y, s, voice, tmp_out, n_frames)
+        cmd = build_render_cmd(canvas, codec, layout, x, y, s, voice, tmp_out,
+                               n_frames)
         errlog = Path(td) / "ffmpeg.log"
         rp = Progress(n_frames, f"  {person.name}: rendering", live)
 
@@ -1118,6 +1139,11 @@ def parse_args() -> argparse.Namespace:
                          "is treated as --indir instead.")
     ap.add_argument("--person", action="append", default=[], metavar="NAME",
                     help="only process this person; repeatable")
+    ap.add_argument("--codec", choices=sorted(CODECS), default=None,
+                    help="overlay video codec: qtrle (default, .mov, most "
+                         "compatible), ffv1 (.mkv, smallest, archival-grade), "
+                         "utvideo (.mkv, fastest timeline scrubbing). All "
+                         "lossless with alpha.")
     ap.add_argument("--canvas", choices=["full", "tight"], default=None,
                     help="tight (default): just the head, ~24x faster and "
                          "smaller, position set once in Kdenlive. full: a "
@@ -1203,6 +1229,10 @@ def _main(args: argparse.Namespace) -> None:
             p.gate.normalize = True
 
     canvas = args.canvas or out_cfg.get("canvas", "tight")
+    codec = args.codec or out_cfg.get("codec", "qtrle")
+    if codec not in CODECS:
+        die(f"[output] codec must be one of {', '.join(sorted(CODECS))} "
+            f"(got {codec!r})")
     indir = (args.indir or (Path(in_cfg["dir"]) if "dir" in in_cfg
                             else Path.cwd()))
     date = args.date or in_cfg.get("date")
@@ -1251,7 +1281,7 @@ def _main(args: argparse.Namespace) -> None:
 
     print(f"indicate-speaker: {layout.width}x{layout.height} @ "
           f"{layout.fps:g} fps, {len(people_sel)} overlay(s), "
-          f"canvas={canvas}, jobs={jobs}")
+          f"canvas={canvas}, codec={codec}, jobs={jobs}")
 
     single = jobs <= 1 or len(people_sel) <= 1
     live = single and sys.stdout.isatty()
@@ -1259,14 +1289,15 @@ def _main(args: argparse.Namespace) -> None:
 
     def job(item: tuple[int, Person]) -> None:
         idx, person = item
-        out_path = outdir / f"{person.name.lower()}_speaker.mov"
+        out_path = outdir / f"{person.name.lower()}_speaker{CODECS[codec][2]}"
         if args.skip_existing and out_path.is_file() and not args.dry_run:
             print(f"  {person.name}: exists, skipped ({out_path.name})",
                   flush=True)
             return
         try:
             render_overlay(person, idx, layout, person.gate or gate, out_path,
-                           canvas, args.preview, args.dry_run, live, abort)
+                           canvas, codec, args.preview, args.dry_run, live,
+                           abort)
         except BaseException:
             abort.set()      # tell sibling jobs to stop promptly
             raise
