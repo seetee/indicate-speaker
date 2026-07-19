@@ -111,6 +111,8 @@ If `CONFIG.toml` is omitted the script looks for `indicate-speaker.toml` next to
 | `--contact-sheet` | off | Write a PNG preview of all heads and exit |
 | `--plot` | off | Write `<name>_envelope.png` timelines (loudness, thresholds, activation) next to the overlays |
 | `--stats` | off | Write `talk_stats.md`/`.csv` (talk time, share, longest monologue); combine with `--dry-run` to skip rendering |
+| `--sync` | off | Compute each recording's start offset from a shared audio track (see [Automatic sync](#automatic-sync)) |
+| `--sync-window SECONDS` | `1800` | How much of each recording `--sync` reads; `0` = whole file |
 | `--refresh-heads` | off | Re-download avatar heads instead of using cached copies |
 | `--preview SECONDS` | off | Only process the first N seconds (also skips the slow track-bleed check) |
 | `--skip-existing` | off | Leave finished overlays alone — cheap retry after one person's render failed |
@@ -121,6 +123,23 @@ If `CONFIG.toml` is omitted the script looks for `indicate-speaker.toml` next to
 Each MKV must be named `YYYY-MM-DD_<suffix>.mkv`, where `<suffix>` matches the `suffix` field in the config. For example, a config with `suffix = "k"` and `--date 2026-06-27` looks for `2026-06-27_k.mkv`.
 
 If the folder contains exactly one episode (one file per suffix), `--date` can be omitted. If `--indir` points at a root rather than an episode folder, the newest complete episode found up to two levels below it is used; `--date` picks an older one.
+
+### Automatic sync
+
+`--sync` cross-correlates a shared audio signal across everyone's recordings and prints each recording's start offset relative to the first person — numbers you can type straight into Kdenlive instead of aligning waveforms by eye. When `--stats` runs in the same invocation, the offsets also unlock cross-person statistics (interruptions).
+
+It only works when the recordings genuinely share a signal, and it **refuses rather than guesses** when they don't (the correlation peak must be at least 3× stronger than any rival alignment). Separate mic tracks do not qualify — each machine only hears its own player. The one-time setup that makes it work:
+
+1. In OBS on **every** machine, add the voice-chat output (e.g. the Discord playback device) as an audio source routed to its own track.
+2. Give that track the same title everywhere, e.g. `Voice chat` (set it in *Advanced Audio Properties* / the recording track labels).
+3. Point the config at it:
+
+```toml
+[sync]
+stream_title = "Voice chat"   # the shared track; per-person override: sync_title
+```
+
+Without a `[sync]` section, `--sync` falls back to each person's voice track — which only works if the voice chat is mixed into it.
 
 ### Kdenlive workflow
 

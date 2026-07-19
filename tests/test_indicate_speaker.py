@@ -200,6 +200,30 @@ def test_normalize_true_and_false_are_unconditional() -> None:
 
 
 # --------------------------------------------------------------------------
+# recording sync
+# --------------------------------------------------------------------------
+
+def test_correlate_offset_recovers_known_shift() -> None:
+    rng = np.random.default_rng(3)
+    hop = M.SYNC_HOP_HZ
+    session = rng.normal(0, 1, int(hop * 1800))        # 30 min shared signal
+    ref = session[: int(hop * 1500)]
+    k0 = int(hop * 137.4)                              # other starts 137.4 s later
+    other = session[k0:k0 + int(hop * 1500)] + rng.normal(0, 0.5, int(hop * 1500))
+    off, peak, ratio = M.correlate_offset(ref, other)
+    assert abs(off - 137.4) < 1.0 / hop * 2, off
+    assert peak >= M.SYNC_MIN_CORR and ratio >= M.SYNC_MIN_RATIO, (peak, ratio)
+
+
+def test_correlate_offset_rejects_unrelated_signals() -> None:
+    rng = np.random.default_rng(4)
+    a = rng.normal(0, 1, int(M.SYNC_HOP_HZ * 900))
+    b = rng.normal(0, 1, int(M.SYNC_HOP_HZ * 900))
+    _, peak, ratio = M.correlate_offset(a, b)
+    assert peak < M.SYNC_MIN_CORR or ratio < M.SYNC_MIN_RATIO, (peak, ratio)
+
+
+# --------------------------------------------------------------------------
 # talk stats
 # --------------------------------------------------------------------------
 

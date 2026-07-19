@@ -28,6 +28,10 @@ stream_title = "Track2"   # the audio stream title read from each MKV
 jobs = 4   # render all four in parallel; use  -j 1  on the slow archive disk
 # codec = "qtrle"   # or "ffv1" (.mkv, half the size) / "utvideo" (.mkv, fast)
 
+# [sync]
+# stream_title = "Voice chat"  # shared track for --sync; needs every machine
+#                              # to record the Discord output as its own track
+
 # --- Optional fine-tuning. Delete any line to use the default shown. ---
 [layout]
 head_size     = 56     # head size in px at 100% (while speaking)

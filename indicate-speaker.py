@@ -261,6 +261,7 @@ class Person:
     nick: str | None = None
     head_file: Path | None = None
     stream_title: str = "Voice audio"
+    sync_title: str | None = None  # shared track for --sync; None = voice
     gate: Gate | None = None     # the global [gate] plus this person's overrides
 
 
@@ -549,6 +550,94 @@ def check_track_bleed(person: Person, aidx: int, duration: float) -> None:
                  f"{-drop:.0f} dB below it) — in OBS Advanced Audio "
                  f"Properties, that source is probably also routed onto the "
                  f"voice track.")
+
+
+# --------------------------------------------------------------------------
+# Recording sync (--sync)
+# --------------------------------------------------------------------------
+
+SYNC_HOP_HZ = 20.0        # envelope rate used for cross-correlation
+SYNC_MIN_CORR = 0.30      # minimum normalised correlation to accept
+SYNC_MIN_RATIO = 3.0      # peak must beat the best rival lag by this factor
+
+
+def _sync_envelope(path: Path, stream_index: int,
+                   limit_s: float | None) -> np.ndarray:
+    """Zero-mean RMS envelope at SYNC_HOP_HZ of one audio stream."""
+    hop = int(ANALYSIS_RATE / SYNC_HOP_HZ)
+    cmd = ["ffmpeg", "-v", "error"]
+    if limit_s:
+        cmd += ["-t", f"{limit_s}"]
+    cmd += ["-i", str(path), "-map", f"0:{stream_index}", "-ac", "1",
+            "-ar", str(ANALYSIS_RATE), "-f", "s16le", "pipe:1"]
+    out = subprocess.run(cmd, capture_output=True)
+    if out.returncode != 0:
+        die(f"ffmpeg failed reading sync audio from {path}")
+    a = np.frombuffer(out.stdout[:len(out.stdout) & ~1],
+                      dtype=np.int16).astype(np.float64)
+    n = len(a) // hop
+    if n < int(SYNC_HOP_HZ * 60):
+        die(f"{path}: under a minute of sync audio; cannot correlate")
+    e = np.sqrt((a[:n * hop].reshape(n, hop) ** 2).mean(axis=1))
+    return e - e.mean()
+
+
+def correlate_offset(ref: np.ndarray,
+                     other: np.ndarray) -> tuple[float, float, float]:
+    """(offset_s, peak, ratio) between two SYNC_HOP_HZ envelopes.
+
+    offset_s is how much later `other`'s recording started than `ref`'s
+    (negative = earlier). peak is the normalised correlation at the best
+    lag; ratio is peak divided by the best correlation found outside ±2 s
+    of it — the confidence that this is a real alignment, not noise.
+    """
+    n = len(ref) + len(other) - 1
+    nfft = 1 << (n - 1).bit_length()
+    c = np.fft.irfft(np.fft.rfft(ref, nfft)
+                     * np.conj(np.fft.rfft(other, nfft)), nfft)
+    full = np.concatenate([c[nfft - (len(other) - 1):nfft], c[:len(ref)]])
+    lags = np.arange(-(len(other) - 1), len(ref))
+    full /= (np.linalg.norm(ref) * np.linalg.norm(other)) or 1e-9
+    best = int(np.argmax(full))
+    peak = float(full[best])
+    guard = int(2 * SYNC_HOP_HZ)
+    rival = float(np.delete(full, slice(max(0, best - guard),
+                                        best + guard)).max())
+    return lags[best] / SYNC_HOP_HZ, peak, peak / max(rival, 1e-9)
+
+
+def sync_offsets(people: list[Person],
+                 limit_s: float | None) -> dict[str, float] | None:
+    """Start offsets (seconds, relative to the first person) for every
+    person, or None when any pair lacks a trustworthy correlation peak.
+
+    Needs a genuinely shared signal across the recordings — in practice a
+    voice-chat (Discord) output recorded as its own track on every machine
+    (config: [sync] stream_title). Falls back to the voice track, which
+    only works if voice chat is mixed into it.
+    """
+    envs: dict[str, np.ndarray] = {}
+    for p in people:
+        title = p.sync_title or p.stream_title
+        idx = find_audio_index(p.source, title)
+        print(f"  {p.name}: reading sync track '{title}'", flush=True)
+        envs[p.name] = _sync_envelope(p.source, idx, limit_s)
+    ref = people[0].name
+    offsets = {ref: 0.0}
+    ok = True
+    for p in people[1:]:
+        off, peak, ratio = correlate_offset(envs[ref], envs[p.name])
+        if peak >= SYNC_MIN_CORR and ratio >= SYNC_MIN_RATIO:
+            offsets[p.name] = off
+            print(f"  {p.name}: started {off:+.2f}s relative to {ref} "
+                  f"(corr {peak:.2f}, {ratio:.0f}x above noise)", flush=True)
+        else:
+            ok = False
+            warn(f"  {p.name}: no reliable shared signal with {ref} "
+                 f"(corr {peak:.2f}, ratio {ratio:.1f}x) — align manually; "
+                 f"see the README's Automatic sync section for the OBS "
+                 f"setup that makes --sync work.")
+    return offsets if ok else None
 
 
 # --------------------------------------------------------------------------
@@ -1146,6 +1235,8 @@ def load_config(path: Path) -> tuple[Layout, Gate, list[Person], dict]:
             stream_title=pc.get("stream_title",
                                 cfg.get("project", {}).get(
                                     "stream_title", "Voice audio")),
+            sync_title=pc.get("sync_title",
+                              cfg.get("sync", {}).get("stream_title")),
             gate=pgate,
         ))
     if not people:
@@ -1380,6 +1471,15 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--refresh-heads", action="store_true",
                     help="re-download avatar heads instead of using the "
                          "cached copies (use after someone changes their skin)")
+    ap.add_argument("--sync", action="store_true",
+                    help="compute each recording's start offset by "
+                         "cross-correlating a shared audio track (see the "
+                         "README's Automatic sync section); refuses rather "
+                         "than guesses when no reliable shared signal exists")
+    ap.add_argument("--sync-window", type=float, default=1800.0,
+                    metavar="SECONDS",
+                    help="how much of each recording --sync reads "
+                         "(default 1800; 0 = the whole file)")
     ap.add_argument("--stats", action="store_true",
                     help="write talk_stats.md/.csv (per-person talk time, "
                          "share, longest monologue) next to the overlays; "
@@ -1488,6 +1588,13 @@ def _main(args: argparse.Namespace) -> None:
                 person.stream_title = choices[person.name]
         print()
 
+    offsets: dict[str, float] | None = None
+    if args.sync:
+        window = args.sync_window or None
+        print("Sync: cross-correlating recordings"
+              + (f" (first {_fmt_dur(window)} of each)" if window else ""))
+        offsets = sync_offsets([p for _, p in people_sel], window)
+
     print(f"indicate-speaker: {layout.width}x{layout.height} @ "
           f"{layout.fps:g} fps, {len(people_sel)} overlay(s), "
           f"canvas={canvas}, codec={codec}, jobs={jobs}")
@@ -1533,7 +1640,7 @@ def _main(args: argparse.Namespace) -> None:
     if args.stats and results:
         results.sort(key=lambda t: t[0])     # config (screen) order
         write_stats([(p, r) for _, p, r in results], layout.fps,
-                    outdir, indir, offsets=None)
+                    outdir, indir, offsets)
 
     if not args.dry_run:
         msg = ("Done. In Kdenlive: import the overlays, align each to its "
