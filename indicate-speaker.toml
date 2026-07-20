@@ -26,7 +26,7 @@ stream_title = "Track2"   # the audio stream title read from each MKV
 
 [output]
 jobs = 4   # render all four in parallel; use  -j 1  on the slow archive disk
-# codec = "qtrle"   # or "ffv1" (.mkv, half the size) / "utvideo" (.mkv, fast)
+# codec = "ffv1"    # or "utvideo" (.mkv, fast) / "qtrle" (.mov, for .mov-only tools)
 
 # [sync]
 # stream_title = "Voice chat"  # shared track for --sync; needs every machine

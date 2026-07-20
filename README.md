@@ -10,7 +10,7 @@ Per-player "who is speaking" overlays for Minecraft let's-play editing. Each pla
   <img src="indicate-speaker_preview.png" alt="Quiet vs speaking states for all four players" width="280">
 </p>
 
-Output is one transparent `.mov` overlay per person. Drop them above your footage in Kdenlive (or any NLE that handles QuickTime alpha), align them to their matching source clip once, and you are done.
+Output is one transparent `.mkv` overlay per person (FFV1; `--codec qtrle` gets you a `.mov` instead). Drop them above your footage in Kdenlive (or any NLE that handles alpha), align them to their matching source clip once, and you are done.
 
 ---
 
@@ -23,7 +23,7 @@ Output is one transparent `.mov` overlay per person. Drop them above your footag
 - **Adaptive per-person normalisation** — mics recorded far too quietly are detected automatically and get thresholds derived from their own levels, so they light up as strongly as loud ones (`normalize = "auto"`, the default; `--normalize` forces it for everyone)
 - **Interactive track discovery** (`--discover`) — lists the audio streams in each MKV and saves your choices back to the config
 - **Tight canvas** (default) — encodes only the sprite, ~24× faster and ~3× smaller than a full 1920×1080 frame; position is set once in Kdenlive and saved as an effect favourite
-- **Codec choice** (`--codec`) — qtrle/`.mov` by default; FOSS alternatives `ffv1` (`.mkv`, ~half the size, archival-grade) and `utvideo` (`.mkv`, fastest timeline scrubbing) — all lossless with alpha, all decoding byte-identically
+- **Codec choice** (`--codec`) — FOSS `ffv1`/`.mkv` by default (~half the size of the others, archival-grade); alternatives `utvideo` (`.mkv`, fastest timeline scrubbing) and `qtrle` (`.mov`, for tools that only take `.mov`) — all lossless with alpha, all decoding byte-identically
 - **Parallel rendering** (`--jobs N`) — processes all players simultaneously on multi-core machines
 - **Contact sheet** (`--contact-sheet`) — renders a quiet-vs-speaking PNG preview before you commit to a full encode
 - **Envelope plots** (`--plot`) — a per-person timeline PNG of loudness, gate thresholds, and speaking activation, so threshold tuning is something you can see instead of guess
@@ -100,11 +100,11 @@ If `CONFIG.toml` is omitted the script looks for `indicate-speaker.toml` next to
 | Flag | Default | Description |
 |---|---|---|
 | `--indir DIR` | current directory | Folder with the episode's MKVs, or a root holding several — the newest complete episode up to two levels below is used; prompts when nothing is found |
-| `--outdir DIR` | the episode folder | Where to write the overlay `.mov` files |
+| `--outdir DIR` | the episode folder | Where to write the overlay files |
 | `--date YYYY-MM-DD` | newest | Pick a specific episode when the folder holds several |
 | `--jobs N` / `-j N` | config's `jobs`, else `1` | Render N players in parallel |
 | `--canvas tight\|full` | `tight` | `tight`: sprite only (fast, small). `full`: 1920×1080 frame (drop straight on track) |
-| `--codec qtrle\|ffv1\|utvideo` | `qtrle` | Overlay codec, all lossless with alpha: `qtrle` (`.mov`, most compatible), `ffv1` (`.mkv`, smallest), `utvideo` (`.mkv`, fastest scrubbing) |
+| `--codec ffv1\|utvideo\|qtrle` | `ffv1` | Overlay codec, all lossless with alpha: `ffv1` (`.mkv`, smallest), `utvideo` (`.mkv`, fastest scrubbing), `qtrle` (`.mov`, for tools that only take `.mov`) |
 | `--person NAME` | all | Only process this person; repeatable |
 | `--discover` | off | Interactively pick each person's voice track; saves choices to config |
 | `--normalize` | auto | Force per-person thresholds for everyone (by default they apply automatically only to tracks the configured gate clearly fails) |
@@ -181,7 +181,7 @@ date = "2026-06-27"         # equivalent to --date; omit to use the newest
 [output]
 dir    = "/path/to/out"   # equivalent to --outdir (default: the episode folder)
 canvas = "tight"          # equivalent to --canvas
-codec  = "qtrle"          # equivalent to --codec: qtrle | ffv1 | utvideo
+codec  = "ffv1"           # equivalent to --codec: ffv1 | utvideo | qtrle
 jobs   = 4                # equivalent to --jobs (default: 1)
 ```
 

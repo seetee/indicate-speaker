@@ -42,10 +42,11 @@ the voice for waveform sync). Park them on tracks above the views and, if
 you like, drop them into a Sequence so they become one tidy, still-cuttable
 object that never moves.
 
-Output is QuickTime Animation (qtrle) in a .mov by default: lossless alpha
-that Kdenlive decodes reliably. --codec offers two FOSS alternatives, both
-lossless-with-alpha and decoding byte-identically to qtrle: ffv1 in .mkv
-(roughly half the size) and utvideo in .mkv (fastest timeline scrubbing).
+Output is FFV1 in a .mkv by default: FOSS, lossless alpha that Kdenlive
+decodes reliably, at roughly half the size of the alternatives. --codec
+offers two more, both lossless-with-alpha and decoding byte-identically to
+ffv1: utvideo in .mkv (fastest timeline scrubbing) and QuickTime Animation
+(qtrle) in .mov (for tools that only take .mov).
 (VP9/VP8 alpha WebM is smaller still but its alpha is dropped on decode by
 the same FFmpeg backend Kdenlive uses, so it is not offered — it would
 import as a black box.)
@@ -107,7 +108,8 @@ _BLOOM_LAYERS = (          # (radius_factor, blur_factor, alpha_factor)
 )
 
 # All three are lossless with alpha and decode byte-identically; they differ
-# in size and scrubbing speed. qtrle stays the default for compatibility.
+# in size and scrubbing speed. ffv1 is the default: FOSS and half the size;
+# qtrle remains for tools that want a .mov.
 CODECS = {   # name -> (encoder args, encoder pix_fmt, container ext, muxer)
     "qtrle":   (["-c:v", "qtrle"], "argb", ".mov", "mov"),
     "ffv1":    (["-c:v", "ffv1", "-level", "3", "-slices", "4",
@@ -1432,10 +1434,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--person", action="append", default=[], metavar="NAME",
                     help="only process this person; repeatable")
     ap.add_argument("--codec", choices=sorted(CODECS), default=None,
-                    help="overlay video codec: qtrle (default, .mov, most "
-                         "compatible), ffv1 (.mkv, smallest, archival-grade), "
-                         "utvideo (.mkv, fastest timeline scrubbing). All "
-                         "lossless with alpha.")
+                    help="overlay video codec: ffv1 (default, .mkv, smallest, "
+                         "archival-grade), utvideo (.mkv, fastest timeline "
+                         "scrubbing), qtrle (.mov, for tools that only take "
+                         ".mov). All lossless with alpha.")
     ap.add_argument("--canvas", choices=["full", "tight"], default=None,
                     help="tight (default): just the head, ~24x faster and "
                          "smaller, position set once in Kdenlive. full: a "
@@ -1538,7 +1540,7 @@ def _main(args: argparse.Namespace) -> None:
             p.gate.normalize = True
 
     canvas = args.canvas or out_cfg.get("canvas", "tight")
-    codec = args.codec or out_cfg.get("codec", "qtrle")
+    codec = args.codec or out_cfg.get("codec", "ffv1")
     if codec not in CODECS:
         die(f"[output] codec must be one of {', '.join(sorted(CODECS))} "
             f"(got {codec!r})")
