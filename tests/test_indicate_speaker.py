@@ -348,6 +348,79 @@ def test_frame_loudness_db_with_real_ffmpeg() -> None:
 
 
 # --------------------------------------------------------------------------
+# overlay notes, weak-signal warnings, --init helpers
+# --------------------------------------------------------------------------
+
+def _envelope(peak_db: float, open_db: float = -38.0) -> "M.Envelope":
+    z = np.zeros(8)
+    return M.Envelope(env=z, open_db=open_db, full_db=-16.0, close_db=-46.0,
+                      peak_db=peak_db, normalized=False, db=z)
+
+
+def test_warn_weak_signal_returns_whether_it_warned() -> None:
+    person = M.Person(name="A", colour=(255, 0, 0), suffix="a")
+    # healthy: loud enough and plenty of speech
+    assert M._warn_weak_signal(person, 200.0, 100.0, _envelope(-20.0)) is False
+    # gate can never open
+    assert M._warn_weak_signal(person, 200.0, 0.0, _envelope(-60.0)) is True
+    # opens, but almost no speech detected over a long recording
+    assert M._warn_weak_signal(person, 300.0, 0.4, _envelope(-20.0)) is True
+
+
+def test_write_overlay_notes_positions_and_canvas_modes() -> None:
+    layout = M.Layout()
+    people_sel = [(i, p) for i, p in enumerate(_people("a", "b"))]
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td)
+        notes = M.write_overlay_notes(out, people_sel, layout, "tight", "ffv1")
+        text = notes.read_text()
+        assert notes.name == "indicate-speaker_notes.txt"
+        s = layout.sprite
+        for idx, person in people_sel:
+            x, y = layout.cell_origin(idx)
+            assert f"{person.name.lower()}_speaker.mkv   X={x}  Y={y}" in text
+            assert f"size {s}x{s}" in text
+        # full canvas: no positions, and qtrle means .mov filenames
+        text = M.write_overlay_notes(out, people_sel, layout,
+                                     "full", "qtrle").read_text()
+        assert "X=" not in text and "a_speaker.mov" in text
+
+
+def test_episode_suffixes_newest_date_wins() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        for name in ("2025-05-23_k.mkv", "2025-06-30_k.mkv",
+                     "2025-06-30_h.mkv", "notes.mkv"):
+            (d / name).touch()
+        files = M.episode_suffixes(d)
+        assert sorted(files) == ["h", "k"]
+        assert all(f.name.startswith("2025-06-30_") for f in files.values())
+        empty = d / "empty"
+        empty.mkdir()
+        assert M.episode_suffixes(empty) == {}
+
+
+def test_init_config_text_round_trips_through_load_config() -> None:
+    entries = [{"name": 'Al "quotey" \\Bäk', "suffix": "a",
+                "nick": "alpha", "stream_title": 'Voice "2"'},
+               {"name": "Bo", "suffix": "b",
+                "nick": "beta", "stream_title": "Voice audio"}]
+    text = M.init_config_text(entries)
+    parsed = tomllib.loads(text)          # valid TOML despite hostile strings
+    assert [p["name"] for p in parsed["person"]] == [e["name"]
+                                                     for e in entries]
+    with tempfile.TemporaryDirectory() as td:
+        cfg = Path(td) / "indicate-speaker.toml"
+        cfg.write_text(text)
+        _, gate, people, _ = M.load_config(cfg)
+        assert gate.normalize == "auto"   # commented defaults stay defaults
+        assert [p.suffix for p in people] == ["a", "b"]
+        assert people[0].stream_title == 'Voice "2"'
+        assert all(p.colour != people[1].colour or p is people[1]
+                   for p in people)       # distinct palette colours
+
+
+# --------------------------------------------------------------------------
 # plain-python runner (no pytest needed)
 # --------------------------------------------------------------------------
 

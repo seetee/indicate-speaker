@@ -56,13 +56,17 @@ pip install numpy Pillow
 ffmpeg -version
 ```
 
-No build step, no package to install — it is a single script. With [uv](https://docs.astral.sh/uv/) you can skip step 2 entirely: `uv run indicate-speaker.py …` reads the script's inline dependency metadata (PEP 723) and fetches NumPy and Pillow automatically.
+No build step, no package to install — it is a single script. With [uv](https://docs.astral.sh/uv/) you can skip step 2 entirely: the script's shebang is `uv run --script`, so `./indicate-speaker.py …` (or `uv run indicate-speaker.py …`) reads the inline dependency metadata (PEP 723) and fetches NumPy and Pillow automatically.
 
 ---
 
 ## Quick start
 
 ```bash
+# No config yet? Build one interactively from an episode's recordings
+# (asks who each MKV belongs to and which stream is their voice)
+cd /path/to/episode/sources && /path/to/indicate-speaker.py --init
+
 # The common case: run from inside the episode's sources folder — everyone
 # renders in parallel, quiet mics are handled automatically
 cd /path/to/episode/sources && python3 /path/to/indicate-speaker.py
@@ -106,6 +110,7 @@ If `CONFIG.toml` is omitted the script looks for `indicate-speaker.toml` next to
 | `--canvas tight\|full` | `tight` | `tight`: sprite only (fast, small). `full`: 1920×1080 frame (drop straight on track) |
 | `--codec ffv1\|utvideo\|qtrle` | `ffv1` | Overlay codec, all lossless with alpha: `ffv1` (`.mkv`, smallest), `utvideo` (`.mkv`, fastest scrubbing), `qtrle` (`.mov`, for tools that only take `.mov`) |
 | `--person NAME` | all | Only process this person; repeatable |
+| `--init` | off | First-run setup: scan the episode's MKVs, ask who each belongs to, pick voice tracks, write a starter config, and exit |
 | `--discover` | off | Interactively pick each person's voice track; saves choices to config |
 | `--normalize` | auto | Force per-person thresholds for everyone (by default they apply automatically only to tracks the configured gate clearly fails) |
 | `--contact-sheet` | off | Write a PNG preview of all heads and exit |
@@ -143,7 +148,9 @@ Without a `[sync]` section, `--sync` falls back to each person's voice track —
 
 ### Kdenlive workflow
 
-1. **Tight canvas** (default): after importing an overlay, add a **Transform** effect, set *Size* to the sprite's native pixel dimensions and *Position* to the `X=… Y=…` values printed by the script. Save it as an effect favourite to re-apply in one click.
+Every render also writes `indicate-speaker_notes.txt` next to the overlays with these steps and each overlay's exact position, so nothing depends on console output that has scrolled away.
+
+1. **Tight canvas** (default): after importing an overlay, add a **Transform** effect, set *Size* to the sprite's native pixel dimensions and *Position* to the `X=… Y=…` values from the notes file. Save it as an effect favourite to re-apply in one click.
 2. Align the overlay to its matching source by waveform (mute the overlay audio track afterwards — it is there only to aid sync).
 3. Group the overlay with its source clip so they stay together when you cut.
 4. Optionally select all overlays and create a **Sequence** so they become one tidy, cuttable object that never shifts relative to each other.
@@ -225,7 +232,7 @@ norm_high_pct        = 90.0   # percentile of active frames mapped to full_db
 
 Any `[gate]` value can also be set inside a `[[person]]` section to override it for that person only — handy for one unusually quiet or loud mic.
 
-The script also warns when something looks wrong with the audio: when a person's loudness never reaches the gate (the head would stay dark for the whole episode), and when another stream — typically game audio — appears to bleed into the chosen voice track (checked by correlating the streams over a sample from the middle of the recording). All warnings are repeated in a summary at the end of the run, so they are not lost between progress lines when rendering with `--jobs`.
+The script also warns when something looks wrong with the audio: when a person's loudness never reaches the gate (the head would stay dark for the whole episode), and when another stream — typically game audio — appears to bleed into the chosen voice track (checked by correlating the streams over a sample from the middle of the recording). A gate warning automatically writes that person's envelope plot (as if `--plot` had been passed), so the problem is visible without a re-run. All warnings are repeated in a summary at the end of the run, so they are not lost between progress lines when rendering with `--jobs`.
 
 ### `[[person]]`
 

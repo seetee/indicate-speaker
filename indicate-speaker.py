@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
 #
 # indicate-speaker.py — per-voice "who is speaking" overlays for let's-play editing.
 # Copyright (C) 2026  seetee
@@ -54,17 +54,20 @@ import as a black box.)
 Two canvas modes:
   --canvas tight  (default) just the head sprite. ~24x faster and ~3x
                   smaller; you set each clip's size + position once in
-                  Kdenlive (the script prints the exact X/Y) and save it as
-                  an effect favourite.
+                  Kdenlive and save it as an effect favourite. The exact
+                  X/Y values land, with the import steps, in
+                  indicate-speaker_notes.txt next to the overlays.
   --canvas full   a 1920x1080 frame with the head pre-positioned. Drop
                   straight onto a track, no positioning, but much bigger
                   (~3 GB/hour) and slower to encode.
 
 Requirements: Python 3.11+, numpy, Pillow, ffmpeg + ffprobe on PATH.
+With uv installed, ./indicate-speaker.py fetches the Python deps itself.
 
     python3 indicate-speaker.py [CONFIG.toml] [options]
 
-Run it on one episode first. Licensed under the GNU AGPL v3 or later (see
+First run and no config yet? --init scans one episode's recordings and
+builds the config interactively. Run it on one episode first. Licensed under the GNU AGPL v3 or later (see
 the notice above and the LICENSE file); comes with NO WARRANTY.
 """
 
@@ -1040,8 +1043,10 @@ def _print_summary(person: Person, duration: float, speaking_s: float,
 
 
 def _warn_weak_signal(person: Person, duration: float, speaking_s: float,
-                      res: Envelope) -> None:
-    """Say so, loudly, when the gate can never (or almost never) open."""
+                      res: Envelope) -> bool:
+    """Say so, loudly, when the gate can never (or almost never) open.
+    Returns True when a warning was issued (callers then auto-write the
+    envelope plot so the problem is visible without a --plot re-run)."""
     if res.peak_db < res.open_db:
         hint = ("even the track's own statistics found no usable speech — "
                 "check the recording"
@@ -1052,11 +1057,57 @@ def _warn_weak_signal(person: Person, duration: float, speaking_s: float,
              f"{res.peak_db:.0f} dB but the gate only opens above "
              f"{res.open_db:.0f} dB — the head will never light up. Raise "
              f"the mic gain in OBS for future sessions; {hint}.")
+        return True
     elif duration >= 120.0 and speaking_s < max(5.0, 0.002 * duration):
         hint = "" if res.normalized else " (try --normalize)"
         warn(f"  {person.name}: warning: only {speaking_s:.0f}s of speech "
              f"detected in {_fmt_dur(duration)} — if they talked more than "
              f"that, the gate thresholds are too high for this mic{hint}.")
+        return True
+    return False
+
+
+def write_overlay_notes(outdir: Path, people_sel: list[tuple[int, Person]],
+                        layout: Layout, canvas: str, codec: str) -> Path:
+    """Write the Kdenlive import steps (and, in tight mode, each overlay's
+    Transform position) to a text file next to the overlays, so the values
+    survive the console scrolling away."""
+    ext = CODECS[codec][2]
+    s = layout.sprite
+    lines = ["indicate-speaker overlay notes",
+             "==============================",
+             "",
+             f"Overlays (canvas={canvas}, codec={codec}):",
+             ""]
+    width = max(len(p.name) for _, p in people_sel) + len(f"_speaker{ext}")
+    for idx, person in people_sel:
+        row = f"  {f'{person.name.lower()}_speaker{ext}':<{width}}"
+        if canvas == "tight":
+            x, y = layout.cell_origin(idx)
+            row += f"   X={x}  Y={y}  size {s}x{s}"
+        lines.append(row.rstrip())
+    lines += ["",
+              "In Kdenlive:",
+              "  1. Import the overlays and align each to its matching source",
+              "     clip (group with it, then sync as you already do).",
+              "  2. Mute the overlay audio and park them on tracks above the",
+              "     views."]
+    if canvas == "tight":
+        lines += [
+              "  3. On each overlay add a Transform effect, set Size to the",
+              "     clip's native pixels and Position to the X/Y above (X is",
+              "     the same for all; Y steps down per person). Save it as an",
+              "     effect favourite to reapply in one click.",
+              "  4. Optionally select them all and create a Sequence so they",
+              "     become one tidy, still-cuttable object that never moves."]
+    else:
+        lines += [
+              "  3. Full canvas: drop straight on a track, no positioning.",
+              "  4. Optionally select them all and create a Sequence so they",
+              "     become one tidy, still-cuttable object that never moves."]
+    notes = outdir / "indicate-speaker_notes.txt"
+    notes.write_text("\n".join(lines) + "\n")
+    return notes
 
 
 def render_overlay(person: Person, idx: int, layout: Layout, gate: Gate,
@@ -1077,11 +1128,12 @@ def render_overlay(person: Person, idx: int, layout: Layout, gate: Gate,
     if preview_s is None:
         check_track_bleed(person, aidx, full_duration)
 
-    def maybe_plot(res: Envelope) -> None:
-        if plot:
+    def maybe_plot(res: Envelope, force: bool = False) -> None:
+        if plot or force:
             png = out_path.with_name(f"{person.name.lower()}_envelope.png")
             plot_envelope(person, res, layout.fps, png)
-            print(f"  {person.name}: envelope plot  ->  {png.name}",
+            why = "" if plot else " (to help diagnose the warning)"
+            print(f"  {person.name}: envelope plot{why}  ->  {png.name}",
                   flush=True)
 
     if dry_run:
@@ -1091,8 +1143,8 @@ def render_overlay(person: Person, idx: int, layout: Layout, gate: Gate,
         speaking_s = float((res.env > 0.15).sum()) / layout.fps
         _print_summary(person, duration, speaking_s, aidx, note, live,
                        gate, res)
-        _warn_weak_signal(person, duration, speaking_s, res)
-        maybe_plot(res)
+        warned = _warn_weak_signal(person, duration, speaking_s, res)
+        maybe_plot(res, force=warned)
         return res
 
     # fetch the head first so a network or avatar problem fails in seconds,
@@ -1109,8 +1161,8 @@ def render_overlay(person: Person, idx: int, layout: Layout, gate: Gate,
         speaking_s = float((env > 0.15).sum()) / layout.fps
         _print_summary(person, duration, speaking_s, aidx, note, live,
                        gate, res)
-        _warn_weak_signal(person, duration, speaking_s, res)
-        maybe_plot(res)
+        warned = _warn_weak_signal(person, duration, speaking_s, res)
+        maybe_plot(res, force=warned)
 
         levels = np.clip((env * (LEVELS - 1)).round().astype(np.int64),
                          0, LEVELS - 1)
@@ -1246,6 +1298,21 @@ def load_config(path: Path) -> tuple[Layout, Gate, list[Person], dict]:
     return layout, gate, people, cfg
 
 
+# the naming contract for source recordings: YYYY-MM-DD_<suffix>.mkv
+_EPISODE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})_(.+)\.mkv$")
+
+
+def episode_suffixes(indir: Path) -> dict[str, Path]:
+    """The newest episode's recordings directly in `indir`, keyed by
+    filename suffix (the k in YYYY-MM-DD_k.mkv)."""
+    by_date: dict[str, dict[str, Path]] = {}
+    for f in sorted(indir.glob("*.mkv")):
+        m = _EPISODE_RE.match(f.name)
+        if m:
+            by_date.setdefault(m.group(1), {})[m.group(2)] = f
+    return by_date[max(by_date)] if by_date else {}
+
+
 def find_episode_dir(indir: Path, people: list[Person],
                      date: str | None) -> Path:
     """Resolve the episode folder: `indir` itself when it already holds the
@@ -1263,7 +1330,7 @@ def find_episode_dir(indir: Path, people: list[Person],
     episodes: dict[tuple[str, Path], set[str]] = {}
     for pattern in ("*/*.mkv", "*/*/*.mkv"):
         for f in indir.glob(pattern):
-            m = re.match(r"(\d{4}-\d{2}-\d{2})_(.+)\.mkv$", f.name)
+            m = _EPISODE_RE.match(f.name)
             if m and m.group(2) in suffixes:
                 episodes.setdefault((m.group(1), f.parent),
                                     set()).add(m.group(2))
@@ -1418,6 +1485,95 @@ def patch_config_stream_titles(config_path: Path, choices: dict[str, str]) -> No
 
 
 # --------------------------------------------------------------------------
+# First-run setup (--init)
+# --------------------------------------------------------------------------
+
+_INIT_COLOURS = ("#33c1ff", "#ff9f43", "#2ecc71", "#e84393",
+                 "#f1c40f", "#9b59b6", "#e74c3c", "#1abc9c")
+
+
+def init_config_text(entries: list[dict[str, str]]) -> str:
+    """A starter TOML for --init: commented defaults plus one [[person]]
+    per entry (keys: name, suffix, nick, stream_title). Written textually,
+    like the rest of the config handling, so comments survive later
+    --discover patches."""
+    parts = [
+        "# indicate-speaker configuration (generated by --init)\n"
+        "# Uncommented values below are the defaults; see the README for\n"
+        "# every option.\n"
+        "\n"
+        "# [layout]\n"
+        "# head_size = 56      # pixel size of a speaking head\n"
+        "# gap = 8             # vertical gap between heads\n"
+        "\n"
+        "# [gate]\n"
+        '# normalize = "auto"  # per-person thresholds when the fixed gate fails\n'
+        "# open_db = -38.0     # envelope starts opening above this\n"
+        "# full_db = -16.0     # fully lit at/above this\n"
+        "# close_db = -46.0    # forced toward silence below this\n"
+        "\n"
+        "# [output]\n"
+        '# codec = "ffv1"      # or "utvideo" (.mkv, fast) / "qtrle" (.mov)\n'
+        "# jobs = 1            # render this many people in parallel\n"]
+    for i, e in enumerate(entries):
+        parts.append(
+            "\n[[person]]\n"
+            f"name = {json.dumps(e['name'])}\n"
+            f"suffix = {json.dumps(e['suffix'])}"
+            f"  # matches YYYY-MM-DD_{e['suffix']}.mkv\n"
+            f"nick = {json.dumps(e['nick'])}"
+            f"  # Minecraft name, used to fetch the head\n"
+            f"stream_title = {json.dumps(e['stream_title'])}\n"
+            f'colour = "{_INIT_COLOURS[i % len(_INIT_COLOURS)]}"\n')
+    return "".join(parts)
+
+
+def _ask(prompt: str) -> str:
+    try:
+        return input(prompt).strip()
+    except EOFError:
+        return ""
+
+
+def init_wizard(target: Path, indir: Path) -> None:
+    """Interactively build a starter config from one episode's recordings."""
+    if target.exists():
+        die(f"{target} already exists; --init refuses to overwrite it. "
+            f"Use --discover to update voice tracks instead.")
+    files = episode_suffixes(indir) if indir.is_dir() else {}
+    while not files:
+        print(f"No YYYY-MM-DD_<suffix>.mkv recordings found in {indir}.")
+        raw = _ask("Episode sources directory (blank to abort): ")
+        if not raw:
+            die("aborted: --init needs a folder with one episode's MKV files")
+        indir = Path(raw).expanduser()
+        files = episode_suffixes(indir) if indir.is_dir() else {}
+
+    print(f"Found {len(files)} recording(s) in {indir}.")
+    people: list[Person] = []
+    for suffix, f in sorted(files.items()):
+        name = _ask(f"  {f.name}: person's name (blank to skip): ")
+        if not name:
+            continue
+        if any(p.name.lower() == name.lower() for p in people):
+            die(f"two recordings can't both belong to {name}")
+        nick = _ask(f"    Minecraft nick [{name}]: ") or name
+        people.append(Person(name=name, colour=(0, 0, 0), source=f,
+                             suffix=suffix, nick=nick))
+    if not people:
+        die("aborted: no people entered")
+
+    choices = discover_stream_titles(people)
+    target.write_text(init_config_text(
+        [{"name": p.name, "suffix": p.suffix or "", "nick": p.nick or "",
+          "stream_title": choices.get(p.name, "Voice audio")}
+         for p in people]))
+    print(f"\nWrote {target}")
+    print("Next: check the heads with --contact-sheet, then render a quick "
+          "sample with --preview 30.")
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -1458,6 +1614,11 @@ def parse_args() -> argparse.Namespace:
                     help="write a PNG preview of every head and exit")
     ap.add_argument("--preview", type=float, default=None, metavar="SECONDS",
                     help="only process the first SECONDS, for a quick look")
+    ap.add_argument("--init", action="store_true",
+                    help="first-run setup: scan --indir (default: the "
+                         "current directory) for YYYY-MM-DD_<suffix>.mkv "
+                         "recordings, ask who each belongs to, pick voice "
+                         "tracks, write a starter config, and exit")
     ap.add_argument("--discover", action="store_true",
                     help="list each person's audio tracks and interactively "
                          "pick the voice track; optionally saves choices to "
@@ -1517,6 +1678,13 @@ def _main(args: argparse.Namespace) -> None:
         if args.indir is None:
             args.indir = args.config
         args.config = None
+    if args.init:
+        if not sys.stdin.isatty():
+            die("--init requires an interactive terminal")
+        target = args.config or Path(__file__).resolve().with_name(
+            "indicate-speaker.toml")
+        init_wizard(target, args.indir or Path.cwd())
+        return
     if args.config is None:
         args.config = _find_config()
     if not args.config.is_file():
@@ -1645,17 +1813,10 @@ def _main(args: argparse.Namespace) -> None:
                     outdir, indir, offsets)
 
     if not args.dry_run:
-        msg = ("Done. In Kdenlive: import the overlays, align each to its "
-               "matching source (group with it, then sync as you already do), "
-               "mute the overlay audio, and park them on tracks above the "
-               "views. Optionally select them all and create a Sequence so "
-               "they become one tidy, still-cuttable object.")
-        if canvas == "tight":
-            msg += (" Tight mode: on each overlay add a Transform effect, set "
-                    "Size to the clip's native pixels and Position to the X/Y "
-                    "printed above (X is 0 for all; Y steps down per person). "
-                    "Save it as an effect favourite to reapply in one click.")
-        print(msg)
+        notes = write_overlay_notes(outdir, people_sel, layout, canvas, codec)
+        print(f"Done. Kdenlive import steps"
+              + (" + positions" if canvas == "tight" else "")
+              + f"  ->  {notes}")
 
     with _warn_lock:
         pending_warnings = list(_warnings)
