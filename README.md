@@ -264,6 +264,18 @@ uv run --with pytest --with numpy --with pillow -m pytest tests/  # via pytest
 
 ---
 
+## Roadmap
+
+Simplification pass on `b8c4447` (~44 lines to cut, no behaviour change):
+
+- Drop the 20 lines of commented-out defaults `--init` writes into the starter config — they duplicate this README and rot on the next default change; one "see the README" line replaces them.
+- Reuse `_ask` at the three remaining inline `try/input/except EOFError` sites.
+- Replace `init_wizard`'s directory re-prompt loop with `die()`; `ask_episode_dir` already has that loop.
+- `write_overlay_notes`: drop the column-padding math, and emit the shared Kdenlive step once instead of once per canvas branch.
+- Collapse the final `Done.` print into a single f-string.
+
+---
+
 ## License
 
 GNU Affero General Public License v3.0 or later. See [LICENSE](LICENSE).
