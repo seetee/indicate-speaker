@@ -1,0 +1,40 @@
+# theme.toml: one per game. Put it next to the .kdenlive project or in any
+# folder above it (e.g. the season folder), or pass --theme.
+# Paths are relative to this file.
+
+sound    = "../_assets/namecard/60003__qubodup__loud-swosh-16.flac"  # plays on every view switch
+# backdrop = "backdrop.png"     # behind the avatars; omitted = dark translucent panel
+# font     = "../_assets/Monocraft.otf"   # omitted = system sans-serif bold
+# position = "top-left"         # top-left | top-right | bottom-left | bottom-right
+# margin   = 24                 # px from the frame edges
+# avatar_size = 48              # px; the viewed player's avatar is drawn 25% larger
+# sound_offset = 0.0            # s; move every transition sound later (+) or earlier (-)
+
+# 1-8 players. `source` is matched against the file names of the video clips
+# on the timeline: it decides whose view is on screen, whatever track the clip
+# sits on. `voice_track` is the Kdenlive audio track with their voice
+# (default: the player's name).
+[[player]]
+name   = "Henrik"
+colour = "#e0a030"
+avatar = "avatars/henrik.png"   # a Minecraft head, an icon, anything square
+source = "*_h.mkv"
+
+[[player]]
+name   = "Joel"
+colour = "#2ea043"
+avatar = "avatars/joel.png"
+source = "*_j.mkv"
+
+[[player]]
+name   = "Kenneth"
+colour = "#c83c5a"
+avatar = "avatars/kenneth.png"
+source = "*_k.mkv"
+
+[[player]]
+name   = "Robin"
+colour = "#3884f4"
+avatar = "avatars/robin.png"
+source = "*_r.mkv"
+# voice_track = "Robin mic"     # when the audio track has another name

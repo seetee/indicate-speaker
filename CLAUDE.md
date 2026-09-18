@@ -4,64 +4,42 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A single-file Python tool (`indicate-speaker.py`, AGPL-3.0-or-later) that renders per-player "who is speaking" overlay videos for Minecraft let's-play editing. For each person in the config it reads their voice track from an MKV, converts loudness into a 0–1 speaking activation, and encodes a transparent FFV1 `.mkv` where their Minecraft avatar head lights up, scales, and glows while they talk.
+`indicate-speaker` (AGPL-3.0-or-later) reads a Kdenlive project of a multi-player let's play and patches it **in place**, after a timestamped `.bak`. It adds one video track and one audio track, both named `indicate-speaker`:
+- The video track holds a transparent overlay: a backdrop with 1–8 player avatars, the viewed player enlarged with a name label, and a talking marker on whoever speaks.
+- The audio track holds a transition sound at every switch between players' views.
 
-There is no build step or linter. Dependencies: Python 3.11+ (uses stdlib `tomllib`), `numpy`, `Pillow`, and `ffmpeg`/`ffprobe` on PATH; the script carries PEP 723 inline metadata and a `uv run --script` shebang, so `./indicate-speaker.py` (or `uv run indicate-speaker.py`) works with zero setup.
+The look comes from a per-game `theme.toml` (see `theme.example.toml`), found next to or above the project.
 
-Tests live in `tests/test_indicate_speaker.py` and run two ways (the system Python has no pip/pytest — use uv for pytest):
+The project file is the single input. Cuts, clip-to-player mapping (by source file name) and each voice's audio stream (`audio_index` on the voice track's clips) all come from it. Don't reintroduce file-name/date/stream-title matching.
 
-```bash
-python3 tests/test_indicate_speaker.py                            # no extra deps
-uv run --with pytest --with numpy --with pillow -m pytest tests/  # single test: -k <name>
-```
-
-ffmpeg-dependent tests self-skip when ffmpeg is absent. The module has a hyphenated filename, so tests load it via `importlib` with a `sys.modules["indspk"]` registration (required for dataclass processing) — reuse that pattern for any new test file.
-
-## Common commands
+## Commands
 
 ```bash
-# Fast visual check of sprite rendering — needs no MKV files
-python3 indicate-speaker.py --contact-sheet
-
-# Analyse audio and report speaking time without rendering (fast-ish sanity check)
-python3 indicate-speaker.py --indir /path/to/episode --dry-run
-
-# Render only the first N seconds — the quickest end-to-end test of a change
-python3 indicate-speaker.py --indir /path/to/episode --preview 30
-
-# Full render, one job per person
-python3 indicate-speaker.py --indir /path/to/episode --jobs 4
-
-# Restrict to one person (repeatable)
-python3 indicate-speaker.py --indir /path/to/episode --person Kenneth
-
-# Interactively identify voice tracks after a recording-setup change;
-# writes stream_title choices back into the TOML (requires a TTY)
-python3 indicate-speaker.py --discover --indir /path/to/episode
-
-# First-run setup: scan an episode's MKVs, ask who each belongs to,
-# and write a starter config (requires a TTY)
-python3 indicate-speaker.py --init --indir /path/to/episode
+uv run indicate-speaker P.kdenlive --dry-run      # analyse only; prints switches + screen/talk %
+uv run indicate-speaker P.kdenlive --preview 90   # first 90 s -> indicate-speaker/overlay-preview.mkv
+uv run indicate-speaker P.kdenlive                # render + patch the project
+uv run pytest                                     # single test: -k <name>; no media needed
 ```
 
-The config (`indicate-speaker.toml` next to the script) is found automatically; source MKVs are matched as `YYYY-MM-DD_<suffix>.mkv` in `--indir`, with `--date` only needed when a folder holds multiple episodes.
+Test end to end only on a **copy** of a real project. The user's projects and Kdenlive backups live under `~/documents/samkvam.online/…` and `~/.local/share/kdenlive/.backup/`.
 
-## Architecture
+## Layout
 
-Everything lives in `indicate-speaker.py`, organised as a pipeline that runs once per person (optionally in parallel via `ThreadPoolExecutor`; a shared `threading.Event` aborts sibling jobs when one fails):
+- `config.py`: `Theme`/`Player` dataclasses and `load_theme`. Every expected failure goes through `die()` → `VoiceError`, printed once by `main()` as `ERROR: …`.
+- `timeline.py`: stdlib ElementTree only, with targeted edits. Everything the tool doesn't own must round-trip untouched.
+  - `load` finds the active sequence tractor (via `docproperties.activetimeline`) and turns playlists into `Entry`s (timeline start, length, resource, src_in, audio_index, fullscreen).
+  - `view_map`: the topmost visible video track showing a player's clip wins. A full-screen non-player clip (avformat/qimage without a `qtblend`/`affine` filter) means "no view".
+  - `view_spans` absorbs runs shorter than `MIN_SPAN`.
+  - `cuts` only counts player→player switches.
+  - `patch` reuses or creates our tracks and bin clips (bin clips are identified by `kdenlive:clipname` prefix `indicate-speaker`), so re-runs are byte-identical.
+  - Inserting a track must renumber `a_track`/`b_track` on the sequence's transitions, the track indices in the `sequenceproperties.groups` JSON, and `activeTrack`/`audioTarget`/`videoTarget`. Those Kdenlive indices exclude the black track, so they are `seq index - 1`. Also bump `tracksCount`.
+- `vad.py`: PyAV decodes each voice entry (seek, then resample to 16 kHz mono). `silero-vad-lite` scores 512-sample windows; `smooth()` applies hysteresis, hangover and minimum burst. There is no loudness gate or normalisation: quiet mics are fine for Silero.
+- `render.py`:
+  - skia draws each frame; PyAV encodes FFV1 `bgra` in `.mkv` (alpha is load-bearing).
+  - The canvas always has the **profile's aspect ratio**, so MLT maps it 1:1 onto a qtblend `rect` of the same size (verified with melt). Don't make it a different aspect.
+  - Label text colour is `on_colour()` (black or white): the better of the two is always ≥ 4.5:1, so no colour ever needs adjusting.
+  - Identical frame states are cached.
 
-1. **Config** (`load_config`): TOML → `Layout`, `Gate`, and `Person` dataclasses. Any `[gate]` key can be overridden inside a `[[person]]` section — each `Person` carries its own merged `Gate` (`replace(gate, **overrides)`), so use `person.gate`, not the global, when rendering.
-2. **Source resolution** (`find_episode_dir` + `resolve_sources`): the input dir defaults to the **current working directory** (the tool is normally run from inside an episode's `sources/` folder). When that dir doesn't hold the MKVs itself, the newest complete episode up to two levels below it is auto-selected; when nothing is found, `ask_episode_dir` prompts interactively for the sources directory (dies when not a TTY). `resolve_sources` then fills `person.source` from suffix + date/glob. Audio streams are matched **by stream title** (`find_audio_index`), not index — OBS track order is unreliable, titles are the contract.
-3. **Audio analysis** (`frame_loudness_db`): decodes the voice stream via ffmpeg to raw s16le at 8 kHz mono and bins RMS per video frame. Deliberately single-pass: the same ffmpeg invocation also writes the voice as a small AAC file (`voice_out`) that later gets muxed (`-c:a copy`) into the overlay for waveform sync in the NLE — do not add a second read of the (large) source.
-4. **Envelope** (`activation_envelope`): maps dBFS to 0–1 activation through open/full/close gate thresholds, then smooths it with a second-order mass-spring-damper (semi-implicit Euler; underdamped for overshoot on attack). `normalize` is three-valued (`"auto"`/`true`/`false`, default `"auto"`): normalization derives all three thresholds — including `close_db` — from that person's own loudness distribution, anchored to the *peak* (not the floor) so noise-gated mics that record silence as −180 dB still work; in `"auto"` mode it is applied only when the fixed gate demonstrably fails the track (`_gate_failed`), re-running the cheap in-memory gating, not the ffmpeg decode. Overshoot above 1.0 is intentionally not clamped in the envelope; the render loop clips to `LEVELS - 1`.
-5. **Sprites** (`render_sprites`): activation is quantised to `LEVELS = 64` pre-rendered RGBA sprite states (head + multi-layer bloom + ring + corner accents). The per-frame loop writes pre-converted bytes: full-activation frames come from `sprite_bytes` untouched, and breathing frames quantise the brightness factor to 1/256 (invisible at 8-bit output) and memoise the result (`frame_cache`, capped at `FRAME_CACHE_MAX`), so recurring states are dict lookups rather than array math.
-6. **Encode** (`render_overlay` / `build_render_cmd`): frames are streamed as rawvideo into ffmpeg's stdin, encoded per the `CODECS` table (`ffv1`/`.mkv` default; `utvideo` in `.mkv` and `qtrle` in `.mov` — all lossless-with-alpha and verified to decode byte-identically). The alpha constraint is load-bearing: VP9/VP8 alpha WebM loses its alpha in the FFmpeg backend Kdenlive uses, so never add a codec without the raw-rgba decode-identity check. The `.mkv` outputs use FLAC (not AAC) for the sync voice — AAC's priming delay makes the matroska muxer shift video by ~21 ms. Two canvas modes: `tight` (default, sprite-sized; Kdenlive position printed as `X=… Y=…`) and `full` (1920×1080 pre-positioned). Output goes to a `.partial` temp name and is `os.replace`d on success. After rendering, `write_overlay_notes` drops `indicate-speaker_notes.txt` (per-overlay positions + Kdenlive import steps) next to the overlays.
+## Verifying against real Kdenlive
 
-Analysis add-ons (all reuse the envelope, no extra decode): `--plot` (`plot_envelope`, Pillow-only timeline PNGs; keep text ASCII — the default font lacks unicode glyphs), `--stats` (`speech_bursts` + `write_stats`, Markdown+CSV; cross-person stats only when `--sync` produced offsets), `--sync` (`sync_offsets`, FFT cross-correlation of 20 Hz envelopes with a confidence gate — it must refuse, not guess, without a genuinely shared track; the crew's pre-2026-07 recordings have none).
-
-Cross-cutting conventions:
-
-- All expected failures go through `die()` → `VoiceError`, caught once in `main()` and printed as `ERROR: …`. Don't call `sys.exit` or print errors from within the pipeline.
-- Audio-quality diagnostics are warnings, not errors: `_warn_weak_signal` (gate can never open / almost no speech detected; when it fires, the person's envelope plot is written even without `--plot`) and `check_track_bleed` (correlates sibling streams over a middle-of-recording window to catch OBS routing game audio onto the mic track; deliberately skipped on `--preview` runs, where its full-file decode would dominate).
-- `--discover` patches the TOML **textually** via regex (`patch_config_stream_titles`) to preserve the user's comments and formatting — don't replace this with a TOML serializer round-trip.
-- Progress output adapts: live `\r`-overwriting lines only when single-job and on a TTY; periodic plain lines otherwise (`Progress`).
+`melt` is not on PATH. Extract it from the AppImage (`~/bin/gearlever_kdenlive_*.appimage --appimage-extract`), source `apprun-hooks/craft-runenv-hook.sh`, and set `LD_LIBRARY_PATH=squashfs-root/usr/lib`. To render the timeline rather than `main_bin`, point the root `producer` attribute at the `kdenlive:projectTractor` tractor. `AppRun --render P.kdenlive out.mp4` (with `QT_QPA_PLATFORM=offscreen`) loads the project through Kdenlive's own document model.

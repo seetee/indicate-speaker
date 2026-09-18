@@ -1,0 +1,22 @@
+[project]
+name = "indicate-speaker"
+version = "2.0.0"
+description = "Adds a who-we-are-watching / who-is-talking overlay to a Kdenlive project"
+license = "AGPL-3.0-or-later"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2",
+    "av>=14",
+    "skia-python>=138",
+    "silero-vad-lite>=0.2",
+]
+
+[project.scripts]
+indicate-speaker = "indicate_speaker.__main__:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
