@@ -100,7 +100,8 @@ def layout(theme: Theme, frame_w: int, frame_h: int) -> Layout:
     gap, pad = max(4, S // 4), max(6, S // 4)
     font_size = max(11, round(S / 3))
     label_h = round(font_size * 1.7)
-    right = theme.position.endswith("right")
+    h, v = anchor(theme.position)
+    right = h == "right"
     run = [pad + V / 2 + i * (V + gap) for i in range(n)]   # centres along the bar
     font = load_font(theme, font_size)
     label_w = max(font.measureText(p.name) for p in theme.players) + label_h
@@ -116,8 +117,8 @@ def layout(theme: Theme, frame_w: int, frame_h: int) -> Layout:
     aw, ah = frame_w // g, frame_h // g
     k = math.ceil(max(pw / aw, ph / ah))
     W, H = aw * k, ah * k
-    px = W - pw if right else 0
-    py = H - ph if theme.position.startswith("bottom") else 0
+    px = {"left": 0, "center": (W - pw) / 2, "right": W - pw}[h]
+    py = {"top": 0, "middle": (H - ph) / 2, "bottom": H - ph}[v]
     if theme.orientation == "vertical":
         cx = px + pw - pad - V / 2 if right else px + pad + V / 2
         slots = tuple((cx, py + y) for y in run)
@@ -132,12 +133,24 @@ def layout(theme: Theme, frame_w: int, frame_h: int) -> Layout:
                   label_h, font_size)
 
 
+def anchor(position: str) -> tuple[str, str]:
+    """"top-left" -> ("left", "top"); "bottom" -> ("center", "bottom"); "left" -> ("left", "middle")."""
+    if "-" in position:
+        v, h = position.split("-")
+    elif position in ("top", "bottom"):
+        v, h = position, "center"
+    else:
+        v, h = "middle", position
+    return h, v
+
+
 def placement(theme: Theme, lay: Layout, frame_w: int, frame_h: int) -> tuple[int, int, int, int]:
-    """Where the canvas goes in the frame: (x, y, w, h) for the qtblend rect."""
-    m = theme.margin
-    x = frame_w - m - lay.W if theme.position.endswith("right") else m
-    y = frame_h - m - lay.H if theme.position.startswith("bottom") else m
-    return x, y, lay.W, lay.H
+    """Where the canvas goes in the frame: (x, y, w, h) for the qtblend rect.
+    The margin applies to the edges the bar sits against; offset nudges the result."""
+    m, (h, v), (dx, dy) = theme.margin, anchor(theme.position), theme.offset
+    x = {"left": m, "center": (frame_w - lay.W) // 2, "right": frame_w - m - lay.W}[h]
+    y = {"top": m, "middle": (frame_h - lay.H) // 2, "bottom": frame_h - m - lay.H}[v]
+    return x + dx, y + dy, lay.W, lay.H
 
 
 def ramp(target: np.ndarray, frames: float) -> np.ndarray:

@@ -208,6 +208,8 @@ def write_theme(tmp_path, extra="", player_extra=""):
     ("avatar_size = 4", "avatar_size must be 16-256"),
     ("codec = \"vp9\"", "codec must be one of ffv1, qtrle"),
     ("orientation = true", "orientation must be one of"),
+    ("offset = [1]", "offset must be \\[x, y\\]"),
+    ("position = \"middle\"", "position must be one of"),
 ])
 def test_bad_theme_values_are_clear_errors(tmp_path, extra, message):
     with pytest.raises(VoiceError, match=message):
@@ -272,6 +274,26 @@ def test_malformed_project_is_a_clear_error(tmp_path):
                                  '<track hide="audio" producer="missing"/>'))
     with pytest.raises(VoiceError, match="unexpected project structure"):
         T.load(p)
+
+
+@pytest.mark.parametrize("position, orientation", [
+    ("left", "vertical"), ("right", "vertical"), ("top", "horizontal"), ("bottom", "horizontal"),
+    ("bottom", "vertical"), ("left", "horizontal")])
+def test_edge_centred_positions(tmp_path, position, orientation):
+    theme = load_theme(write_theme(tmp_path, f'position = "{position}"\n'
+                                             f'orientation = "{orientation}"\noffset = [5, -7]'))
+    lay = render.layout(theme, 1920, 1080)
+    x, y, w, h = render.placement(theme, lay, 1920, 1080)
+    cx, cy = x + lay.panel.centerX(), y + lay.panel.centerY()   # panel centre in the frame
+    m = theme.margin
+    if position in ("left", "right"):
+        assert abs(cy - (540 - 7)) <= 1
+        edge = x + lay.panel.left() if position == "left" else x + lay.panel.right()
+        assert edge == (m + 5 if position == "left" else 1920 - m + 5)
+    else:
+        assert abs(cx - (960 + 5)) <= 1
+        edge = y + lay.panel.top() if position == "top" else y + lay.panel.bottom()
+        assert edge == (m - 7 if position == "top" else 1080 - m - 7)
 
 
 def test_preview_must_be_positive():

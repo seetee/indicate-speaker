@@ -5,7 +5,9 @@
 sound    = "../_assets/namecard/60003__qubodup__loud-swosh-16.flac"  # plays on every view switch
 # backdrop = "backdrop.png"     # behind the avatars; omitted = dark translucent panel
 # font     = "../_assets/Monocraft.otf"   # omitted = system sans-serif bold
-# position = "top-left"         # top-left | top-right | bottom-left | bottom-right
+# position = "top-left"         # a corner: top-left | top-right | bottom-left | bottom-right
+#                               # or an edge centre: top | bottom | left | right
+# offset   = [0, 0]             # px nudge from there: [right, down]; negative = left/up
 # orientation = "horizontal"    # horizontal: a row, name under the viewed avatar;
 #                               # vertical: a column along the edge, name beside it
 # margin   = 24                 # px from the frame edges

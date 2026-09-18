@@ -5,7 +5,8 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-CORNERS = ("top-left", "top-right", "bottom-left", "bottom-right")
+POSITIONS = ("top-left", "top", "top-right", "left", "right",
+             "bottom-left", "bottom", "bottom-right")   # corners and edge centres
 ORIENTATIONS = ("horizontal", "vertical")
 
 
@@ -34,6 +35,7 @@ class Theme:
     backdrop: Path | None = None
     font: Path | None = None
     position: str = "top-left"
+    offset: tuple[int, int] = (0, 0)   # px nudge after placing: +x right, +y down
     orientation: str = "horizontal"   # a row of avatars, or a column along the edge
     margin: int = 24         # px from the frame edges
     avatar_size: int = 48    # px; the viewed player's avatar is drawn larger
@@ -51,7 +53,7 @@ def parse_colour(text: str, where: str) -> tuple[int, int, int]:
         die(f"{where}: colour must look like \"#e0a030\", got {text!r}")
 
 
-THEME_KEYS = {"sound", "backdrop", "font", "position", "orientation", "margin",
+THEME_KEYS = {"sound", "backdrop", "font", "position", "offset", "orientation", "margin",
               "avatar_size", "sound_offset", "codec", "player"}
 PLAYER_KEYS = {"name", "colour", "avatar", "source", "voice_track"}
 CODECS = ("ffv1", "qtrle")   # ffv1: free/open, lossless; qtrle: ~6x smaller files
@@ -124,8 +126,12 @@ def load_theme(path: Path) -> Theme:
         sound=file(raw["sound"], "sound"),
         backdrop=file(raw["backdrop"], "backdrop") if "backdrop" in raw else None,
         font=file(raw["font"], "font") if "font" in raw else None,
-        position=get(raw, "position", str, "top-left", w, lambda v: v in CORNERS,
-                     "one of " + ", ".join(CORNERS)),
+        position=get(raw, "position", str, "top-left", w, lambda v: v in POSITIONS,
+                     "one of " + ", ".join(POSITIONS)),
+        offset=tuple(get(raw, "offset", list, [0, 0], w,
+                         lambda v: len(v) == 2 and all(type(n) is int and abs(n) <= 4000
+                                                       for n in v),
+                         "[x, y] in whole pixels, e.g. [0, -40]")),
         orientation=get(raw, "orientation", str, "horizontal", w,
                         lambda v: v in ORIENTATIONS, "one of " + ", ".join(ORIENTATIONS)),
         margin=get(raw, "margin", int, 24, w, lambda v: 0 <= v <= 500, "0-500 (px)"),
