@@ -47,16 +47,18 @@ def run(a) -> None:
     project_path = Path(a.project).expanduser().resolve()
     theme = load_theme(Path(a.theme).expanduser().resolve() if a.theme
                        else find_theme(project_path))
-    players = theme.players
-    mtime = project_path.stat().st_mtime_ns if project_path.exists() else None
     proj = timeline.load(project_path)
+    mtime = project_path.stat().st_mtime_ns
     fps = proj.fps
+    players = timeline.with_sources(proj, theme.players)
+    # load every image and font now: a bad asset should fail in a second, not after the analysis
+    painter = render.Painter(theme, render.layout(theme, proj.width, proj.height))
 
     view = timeline.view_map(proj, players)
     if (view < 0).all():
         clips = sorted({Path(e.resource).name for t in proj.tracks if not t.audio
                         for e in t.entries if e.resource})
-        die("no video clip matches any player's source pattern; the project's "
+        die("no video clip belongs to any player; the project's "
             f"video clips are: {', '.join(clips)}")
     spans = timeline.view_spans(view, round(MIN_SPAN * fps))
     cuts = timeline.cuts(spans)
@@ -73,12 +75,12 @@ def run(a) -> None:
     if a.dry_run:
         return
 
-    lay = render.layout(theme, proj.width, proj.height)
     outdir = project_path.parent / "indicate-speaker"
     outdir.mkdir(exist_ok=True)
     n = proj.length if a.preview is None else min(proj.length, round(a.preview * fps))
-    overlay = outdir / ("overlay-preview.mkv" if a.preview is not None else "overlay.mkv")
-    render.render(theme, lay, spans, talking, fps, n, overlay, progress)
+    ext = render.CODECS[theme.codec][0]
+    overlay = outdir / (("overlay-preview" if a.preview is not None else "overlay") + ext)
+    render.render(painter, theme.codec, spans, talking, fps, n, overlay, progress)
     if a.preview is not None:
         print(f"Preview written: {overlay}")
         return
@@ -88,14 +90,29 @@ def run(a) -> None:
     backup = project_path.with_name(f"{project_path.name}.{time.strftime('%Y%m%d-%H%M%S')}.bak")
     shutil.copy2(project_path, backup)
     shift = round(theme.sound_offset * fps)
-    timeline.patch(proj, overlay, render.placement(theme, lay, proj.width, proj.height),
+    timeline.patch(proj, overlay, render.placement(theme, painter.lay, proj.width, proj.height),
                    theme.sound, sound_frames(theme.sound, fps),
                    [c + shift for c in cuts if 0 <= c + shift < proj.length])
     tmp = project_path.with_name(project_path.name + ".partial")
-    timeline.save(proj, tmp)
-    os.replace(tmp, project_path)
+    try:
+        timeline.save(proj, tmp)
+        shutil.copymode(project_path, tmp)   # keep the project's permissions
+        os.replace(tmp, project_path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     print(f"Updated {project_path.name} (backup: {backup.name}). "
           "If it is open in Kdenlive, reopen it without saving first.")
+
+
+def positive(text: str) -> float:
+    try:
+        v = float(text)
+    except ValueError:
+        v = 0
+    if not v > 0:
+        raise argparse.ArgumentTypeError(f"must be a number of seconds above 0, got {text!r}")
+    return v
 
 
 def main(argv=None) -> int:
@@ -103,7 +120,7 @@ def main(argv=None) -> int:
     ap.add_argument("project", help="the .kdenlive project to update in place")
     ap.add_argument("--theme", help="theme TOML (default: theme.toml next to or above the project)")
     ap.add_argument("--dry-run", action="store_true", help="analyse and report; write nothing")
-    ap.add_argument("--preview", type=float, metavar="SECS",
+    ap.add_argument("--preview", type=positive, metavar="SECS",
                     help="render only the first SECS to overlay-preview.mkv; project untouched")
     a = ap.parse_args(argv)
     try:

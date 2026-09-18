@@ -22,12 +22,21 @@ import av
 import numpy as np
 import skia
 
-from .config import Theme
+from .config import Theme, die
 
 FADE = 0.30       # s; overlay in/out and the cut transition
 TALK_FADE = 0.08  # s; talking marker in/out
 DIM = 0.6         # opacity of avatars that are neither viewed nor talking
 BLACK, WHITE = (0, 0, 0), (255, 255, 255)
+
+# theme `codec` -> (file extension, container, pixel format, encoder options).
+# Both are lossless with alpha and decode in Kdenlive; never add a codec
+# without checking that its alpha survives there (VP8/VP9 WebM alpha does not).
+CODECS = {
+    "ffv1": (".mkv", "matroska", "bgra",
+             {"level": "3", "slices": "4", "slicecrc": "1", "context": "1"}),
+    "qtrle": (".mov", "mov", "argb", {}),
+}
 
 
 def luminance(rgb) -> float:
@@ -58,30 +67,69 @@ class Layout:
     panel: skia.Rect
     S: int                 # avatar size, idle
     V: int                 # avatar size, viewed
-    slots: tuple[float, ...]   # avatar centre x per player
-    cy: float                  # avatar centre y
-    label_y: float             # top of the name label
+    slots: tuple[tuple[float, float], ...]    # avatar centre per player
+    labels: tuple[tuple[float, float], ...]   # name label anchor per player: (x, top)
+    align: str             # label x anchor is its "center", "left" or "right" edge
     label_h: float
     font_size: int
 
 
+def load_font(theme: Theme, size: int) -> skia.Font:
+    if theme.font:
+        face = skia.Typeface.MakeFromFile(str(theme.font))
+        if face is None:
+            die(f"font {theme.font} is not a font file skia can read (use .ttf or .otf)")
+    else:
+        face = skia.Typeface("sans-serif", skia.FontStyle.Bold())
+    return skia.Font(face, size)
+
+
+def load_image(path: Path, what: str) -> skia.Image:
+    try:
+        return skia.Image.open(str(path))
+    except RuntimeError:
+        die(f"{what} {path} is not an image skia can read (use .png, .jpg or .webp)")
+
+
 def layout(theme: Theme, frame_w: int, frame_h: int) -> Layout:
+    """Horizontal: a row of avatars, the name label under the viewed one.
+    Vertical: a column of avatars along the frame edge, the label beside the
+    viewed one, pointing into the picture."""
     n, S = len(theme.players), theme.avatar_size
     V = round(S * 1.25)
     gap, pad = max(4, S // 4), max(6, S // 4)
     font_size = max(11, round(S / 3))
     label_h = round(font_size * 1.7)
-    pw = 2 * pad + n * V + (n - 1) * gap
-    ph = pad + V + gap // 2 + label_h + pad
+    right = theme.position.endswith("right")
+    run = [pad + V / 2 + i * (V + gap) for i in range(n)]   # centres along the bar
+    font = load_font(theme, font_size)
+    label_w = max(font.measureText(p.name) for p in theme.players) + label_h
+    row = 2 * pad + n * V + (n - 1) * gap
+    if theme.orientation == "vertical":
+        pw = pad + V + gap + label_w + pad
+        ph = row
+    else:
+        pw = max(row, label_w + 8)       # the label is kept 4 px inside the panel
+        ph = pad + V + gap // 2 + label_h + pad
+        run = [x + (pw - row) / 2 for x in run]   # centre the avatars in a wider panel
     g = math.gcd(frame_w, frame_h)
     aw, ah = frame_w // g, frame_h // g
     k = math.ceil(max(pw / aw, ph / ah))
     W, H = aw * k, ah * k
-    px = W - pw if theme.position.endswith("right") else 0
+    px = W - pw if right else 0
     py = H - ph if theme.position.startswith("bottom") else 0
-    slots = tuple(px + pad + V / 2 + i * (V + gap) for i in range(n))
-    return Layout(W, H, skia.Rect.MakeXYWH(px, py, pw, ph), S, V, slots,
-                  py + pad + V / 2, py + pad + V + gap // 2, label_h, font_size)
+    if theme.orientation == "vertical":
+        cx = px + pw - pad - V / 2 if right else px + pad + V / 2
+        slots = tuple((cx, py + y) for y in run)
+        edge = cx - V / 2 - gap if right else cx + V / 2 + gap
+        labels = tuple((edge, y - label_h / 2) for _, y in slots)
+        align = "right" if right else "left"
+    else:
+        slots = tuple((px + x, py + pad + V / 2) for x in run)
+        labels = tuple((x, py + pad + V + gap // 2) for x, _ in slots)
+        align = "center"
+    return Layout(W, H, skia.Rect.MakeXYWH(px, py, pw, ph), S, V, slots, labels, align,
+                  label_h, font_size)
 
 
 def placement(theme: Theme, lay: Layout, frame_w: int, frame_h: int) -> tuple[int, int, int, int]:
@@ -111,11 +159,9 @@ class Painter:
     def __init__(self, theme: Theme, lay: Layout):
         self.theme, self.lay = theme, lay
         self.surface = skia.Surface(lay.W, lay.H)
-        self.avatars = [skia.Image.open(str(p.avatar)) for p in theme.players]
-        self.backdrop = skia.Image.open(str(theme.backdrop)) if theme.backdrop else None
-        face = (skia.Typeface.MakeFromFile(str(theme.font)) if theme.font
-                else skia.Typeface("sans-serif", skia.FontStyle.Bold()))
-        self.font = skia.Font(face, lay.font_size)
+        self.avatars = [load_image(p.avatar, f"{p.name}'s avatar") for p in theme.players]
+        self.backdrop = load_image(theme.backdrop, "backdrop") if theme.backdrop else None
+        self.font = load_font(theme, lay.font_size)
 
     def _image(self, c: skia.Canvas, img: skia.Image, dst: skia.Rect, cover=False):
         if cover:   # crop to fill dst without distortion
@@ -158,7 +204,8 @@ class Painter:
 
     def _avatar(self, c, i, size, alpha, talk):
         lay, colour = self.lay, self.theme.players[i].colour
-        box = skia.Rect.MakeXYWH(lay.slots[i] - size / 2, lay.cy - size / 2, size, size)
+        cx, cy = lay.slots[i]
+        box = skia.Rect.MakeXYWH(cx - size / 2, cy - size / 2, size, size)
         r = size * 0.18
         c.saveLayerAlpha(None, round(255 * alpha))
         c.save()
@@ -193,13 +240,15 @@ class Painter:
         name = pb.name if e >= 0.5 else pa.name
         wa, wb = (self.font.measureText(p.name) + lay.label_h for p in (pa, pb))
         w = wa + (wb - wa) * e
-        cx = lay.slots[a] + (lay.slots[b] - lay.slots[a]) * e
-        x = min(max(cx - w / 2, lay.panel.left() + 4), lay.panel.right() - 4 - w)
-        box = skia.Rect.MakeXYWH(x, lay.label_y, w, lay.label_h)
+        (ax, ay), (bx, by) = lay.labels[a], lay.labels[b]
+        anchor, top = ax + (bx - ax) * e, ay + (by - ay) * e
+        x = {"center": anchor - w / 2, "left": anchor, "right": anchor - w}[lay.align]
+        x = min(max(x, lay.panel.left() + 4), lay.panel.right() - 4 - w)
+        box = skia.Rect.MakeXYWH(x, top, w, lay.label_h)
         c.drawRRect(skia.RRect.MakeRectXY(box, lay.label_h / 2, lay.label_h / 2),
                     skia.Paint(Color=sk(colour), AntiAlias=True))
         m = self.font.getMetrics()
-        base = lay.label_y + (lay.label_h - (m.fDescent - m.fAscent)) / 2 - m.fAscent
+        base = top + (lay.label_h - (m.fDescent - m.fAscent)) / 2 - m.fAscent
         c.drawString(name, x + (w - self.font.measureText(name)) / 2, base, self.font,
                      skia.Paint(Color=sk(on_colour(colour)), AntiAlias=True))
 
@@ -228,27 +277,34 @@ def frame_states(spans, talking: list[np.ndarray], fps: float, n: int):
                tuple(round(float(l[f]), 2) for l in levels))
 
 
-def render(theme: Theme, lay: Layout, spans, talking, fps: float, n: int, out: Path,
+def render(painter: Painter, codec: str, spans, talking, fps: float, n: int, out: Path,
            progress=lambda done, total: None) -> None:
-    painter = Painter(theme, lay)
+    """Encode n frames to `out` (its extension must match the codec's)."""
+    _, container, pix_fmt, options = CODECS[codec]
     rate = Fraction(fps).limit_denominator(1001)
     tmp = out.with_name(out.name + ".partial")
     cache: dict = {}
-    with av.open(str(tmp), "w", format="matroska") as box:
-        st = box.add_stream("ffv1", rate=rate)
-        st.width, st.height, st.pix_fmt = lay.W, lay.H, "bgra"
-        st.options = {"level": "3", "slices": "4", "slicecrc": "1", "context": "1"}
-        for f, state in enumerate(frame_states(spans, talking, fps, n)):
-            img = cache.get(state)
-            if img is None:
-                if len(cache) > 256:   # steady states repeat; ramps are short-lived
-                    cache.clear()
-                img = cache[state] = painter.draw(*state)
-            frame = av.VideoFrame.from_ndarray(img, format="bgra")
-            frame.pts, frame.time_base = f, 1 / rate
-            box.mux(st.encode(frame))
-            if f % 600 == 0:
-                progress(f, n)
-        box.mux(st.encode(None))
-    os.replace(tmp, out)
+    try:
+        with av.open(str(tmp), "w", format=container) as box:
+            st = box.add_stream(codec, rate=rate)
+            st.width, st.height, st.pix_fmt = painter.lay.W, painter.lay.H, pix_fmt
+            st.options = options
+            for f, state in enumerate(frame_states(spans, talking, fps, n)):
+                img = cache.get(state)
+                if img is None:
+                    if len(cache) > 256:   # steady states repeat; ramps are short-lived
+                        cache.clear()
+                    img = cache[state] = painter.draw(*state)
+                frame = av.VideoFrame.from_ndarray(img, format="bgra")
+                if pix_fmt != "bgra":
+                    frame = frame.reformat(format=pix_fmt)
+                frame.pts, frame.time_base = f, 1 / rate
+                box.mux(st.encode(frame))
+                if f % 600 == 0:
+                    progress(f, n)
+            box.mux(st.encode(None))
+        os.replace(tmp, out)
+    except BaseException:
+        tmp.unlink(missing_ok=True)    # no half-written overlay left behind
+        raise
     progress(n, n)

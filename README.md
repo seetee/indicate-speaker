@@ -34,7 +34,7 @@ uv run indicate-speaker ~/episodes/avsnitt217/avsnitt217.kdenlive --dry-run
 
 - It first saves a backup, `P.kdenlive.YYYYmmdd-HHMMSS.bak`, next to the project.
 - It adds one video track (on top) and one audio track (above your other audio tracks), both named `indicate-speaker`.
-- The video track holds `indicate-speaker/overlay.mkv`, spanning the whole timeline and positioned with a Transform effect. The file is FFV1 with alpha, lossless and FOSS.
+- The video track holds `indicate-speaker/overlay.mkv`, spanning the whole timeline and positioned with a Transform effect. By default the file is FFV1 with alpha, which is lossless, free and open. With `codec = "qtrle"` in the theme it is `overlay.mov` instead: also lossless with alpha, about 6× smaller, but QuickTime's codec.
 - The audio track holds one transition sound per view switch.
 - It adds two bin clips, `indicate-speaker overlay` and `indicate-speaker sound`.
 
@@ -44,8 +44,12 @@ Running it again after you re-edit reuses the same tracks and clips and regenera
 
 Copy [`theme.example.toml`](theme.example.toml) to `theme.toml` next to the project, or into a folder above it such as the season folder; the nearest one wins. Keep one theme per game.
 
-- `source` is a file-name pattern such as `"*_h.mkv"`. It is matched against the video clips on the timeline, so a clip counts as Henrik's view whichever track it sits on.
+- `position` picks the corner (`top-left`, `top-right`, `bottom-left`, `bottom-right`).
+- `orientation = "horizontal"` (the default) draws a row with the name under the viewed avatar. `"vertical"` draws a column along the frame edge with the name beside the viewed avatar, pointing into the picture.
+
 - `voice_track` is the name of the Kdenlive **audio track** holding that player's voice; it defaults to the player's name. The tool uses the audio stream and the cuts you chose on that track.
+- Video clips from the same file as that voice track count as the player's view, whichever video track they sit on. Set `source` only when someone's view is recorded in a different file. It takes a file-name pattern such as `"*_h.mkv"`, or a list of them.
+- Unknown keys get a warning (usually a typo), and wrong values stop the run with a message saying what is expected.
 
 ## How it decides
 

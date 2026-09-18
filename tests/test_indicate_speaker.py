@@ -2,6 +2,7 @@
 
 import itertools
 import xml.etree.ElementTree as ET
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -9,7 +10,7 @@ import numpy as np
 from indicate_speaker import render, timeline as T, vad
 from indicate_speaker.config import Player
 
-PLAYERS = tuple(Player(n, (200, 60, 90), Path("x.png"), f"*_{n[0].lower()}.mkv", n)
+PLAYERS = tuple(Player(n, (200, 60, 90), Path("x.png"), (f"*_{n[0].lower()}.mkv",), n)
                 for n in ("Henrik", "Kenneth"))
 
 
@@ -89,6 +90,14 @@ def test_parse_and_view(tmp_path):
         (0, 100, 2)]
 
 
+def test_source_defaults_to_the_voice_tracks_files(tmp_path):
+    proj = load(tmp_path)
+    bare = (replace(PLAYERS[0], source=()), PLAYERS[1])
+    players = T.with_sources(proj, bare)
+    assert players[0].source == ("2025-08-23_h.mkv",)
+    assert (T.view_map(proj, players) == T.view_map(proj, PLAYERS)).all()
+
+
 def test_patch_adds_tracks_once_and_renumbers(tmp_path):
     proj = load(tmp_path)
     T.patch(proj, tmp_path / "overlay.mkv", (24, 24, 304, 171), tmp_path / "s.flac", 25, [100, 190])
@@ -128,10 +137,13 @@ def test_label_text_contrast_always_passes_wcag_aa():
 
 def test_canvas_matches_frame_aspect():
     from indicate_speaker.config import Theme
-    for n in (1, 4, 8):
-        theme = Theme(players=PLAYERS[:1] * n, sound=Path("s.flac"), position="bottom-right")
+    for n, orientation in itertools.product((1, 4, 8), ("horizontal", "vertical")):
+        theme = Theme(players=PLAYERS[:1] * n, sound=Path("s.flac"), position="bottom-right",
+                      orientation=orientation)
         lay = render.layout(theme, 1920, 1080)
-        assert lay.W * 1080 == lay.H * 1920 and lay.panel.width() <= lay.W
+        assert lay.W * 1080 == lay.H * 1920
+        assert lay.panel.width() <= lay.W and lay.panel.height() <= lay.H
+        assert all(lay.panel.contains(x, y) for x, y in lay.slots)
         x, y, w, h = render.placement(theme, lay, 1920, 1080)
         assert (x + w, y + h) == (1920 - theme.margin, 1080 - theme.margin)
 
@@ -168,3 +180,102 @@ def test_rerun_after_kdenlive_renamed_our_ids(tmp_path):
     sound_entries = [e for pl in root.iter("playlist") for e in pl.findall("entry")
                      if T.props(byid[e.get("producer")]).get("kdenlive:clipname") == "indicate-speaker sound"]
     assert [e.get("out") for e in sound_entries] == ["29", "29"]   # bin entry + the one sound, both refreshed
+
+
+# --- theme, assets and robustness --------------------------------------------
+
+import pytest
+import skia
+
+from indicate_speaker import __main__ as cli
+from indicate_speaker.config import VoiceError, load_theme
+
+
+def write_theme(tmp_path, extra="", player_extra=""):
+    for name in ("a.png", "s.flac"):
+        (tmp_path / name).write_bytes(b"x")
+    avatar = skia.Surface(8, 8)
+    avatar.getCanvas().clear(skia.ColorRED)
+    avatar.makeImageSnapshot().save(str(tmp_path / "a.png"))
+    theme = tmp_path / "theme.toml"
+    theme.write_text(f'sound = "s.flac"\n{extra}\n[[player]]\nname = "Kenneth-the-long"\n'
+                     f'colour = "#c83c5a"\navatar = "a.png"\n{player_extra}\n')
+    return theme
+
+
+@pytest.mark.parametrize("extra, message", [
+    ("margin = \"abc\"", "margin must be 0-500"),
+    ("avatar_size = 4", "avatar_size must be 16-256"),
+    ("codec = \"vp9\"", "codec must be one of ffv1, qtrle"),
+    ("orientation = true", "orientation must be one of"),
+])
+def test_bad_theme_values_are_clear_errors(tmp_path, extra, message):
+    with pytest.raises(VoiceError, match=message):
+        load_theme(write_theme(tmp_path, extra))
+
+
+def test_theme_warns_about_typos_and_takes_source_lists(tmp_path, capsys):
+    theme = load_theme(write_theme(tmp_path, 'orientaton = "vertical"',
+                                   'source = ["*_k.mkv", "*_k2.mkv"]'))
+    assert "unknown key 'orientaton'" in capsys.readouterr().err
+    assert theme.orientation == "horizontal" and theme.players[0].source == ("*_k.mkv", "*_k2.mkv")
+
+
+def test_unreadable_assets_are_clear_errors(tmp_path):
+    theme = load_theme(write_theme(tmp_path, 'font = "s.flac"'))
+    with pytest.raises(VoiceError, match="not a font file"):
+        render.layout(theme, 1920, 1080)
+    theme = load_theme(write_theme(tmp_path, 'backdrop = "s.flac"'))
+    with pytest.raises(VoiceError, match="backdrop .* is not an image"):
+        render.Painter(theme, render.layout(theme, 1920, 1080))
+
+
+@pytest.mark.parametrize("orientation", ["horizontal", "vertical"])
+def test_long_name_fits_inside_the_panel(tmp_path, orientation):
+    theme = load_theme(write_theme(tmp_path, f'orientation = "{orientation}"'))
+    lay = render.layout(theme, 1920, 1080)
+    width = render.load_font(theme, lay.font_size).measureText("Kenneth-the-long") + lay.label_h
+    assert width + 8 <= lay.panel.width() <= lay.W
+
+
+@pytest.mark.parametrize("codec", ["ffv1", "qtrle"])
+def test_render_is_lossless_with_alpha(tmp_path, codec):
+    import av
+    theme = load_theme(write_theme(tmp_path, f'codec = "{codec}"'))
+    painter = render.Painter(theme, render.layout(theme, 1920, 1080))
+    out = tmp_path / ("o" + render.CODECS[codec][0])
+    render.render(painter, codec, [(0, 12, 0)], [np.r_[np.zeros(6, bool), np.ones(6, bool)]],
+                  30.0, 12, out)
+    with av.open(str(out)) as c:
+        frames = [f.to_ndarray(format="bgra") for f in c.decode(video=0)]
+    assert len(frames) == 12 and not (tmp_path / (out.name + ".partial")).exists()
+    want = painter.draw(1.0, -1, 0, 1.0, (1.0,))       # last frame: fully faded in, talking
+    assert (frames[-1] == want).all()
+    assert frames[-1][..., 3].min() == 0 and frames[-1][..., 3].max() == 255   # real alpha
+
+
+def test_new_clip_ids_avoid_sequence_ids(tmp_path):
+    p = tmp_path / "ep.kdenlive"
+    p.write_text(PROJECT.replace('<tractor id="seq" in="0" out="199">',
+                                 '<tractor id="seq" in="0" out="199">'
+                                 '<property name="kdenlive:id">40</property>'))
+    proj = T.load(p)
+    T.patch(proj, tmp_path / "o.mkv", (0, 0, 16, 9), tmp_path / "s.flac", 5, [100])
+    ids = {T.props(e).get("kdenlive:clipname"): T.props(e).get("kdenlive:id")
+           for e in proj.root if e.tag == "chain"}
+    assert ids["indicate-speaker overlay"] == "41" and ids["indicate-speaker sound"] == "42"
+
+
+def test_malformed_project_is_a_clear_error(tmp_path):
+    p = tmp_path / "ep.kdenlive"
+    p.write_text(PROJECT.replace('<track hide="audio" producer="t_vh_a"/>',
+                                 '<track hide="audio" producer="missing"/>'))
+    with pytest.raises(VoiceError, match="unexpected project structure"):
+        T.load(p)
+
+
+def test_preview_must_be_positive():
+    assert cli.positive("1.5") == 1.5
+    for bad in ("0", "-3", "abc"):
+        with pytest.raises(Exception, match="above 0"):
+            cli.positive(bad)

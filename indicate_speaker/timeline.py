@@ -10,7 +10,7 @@ import fnmatch
 import re
 import uuid
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -91,6 +91,14 @@ def load(path: Path) -> Project:
         tree = ET.parse(path)
     except (OSError, ET.ParseError) as e:
         die(f"cannot read project {path}: {e}")
+    try:
+        return _read(path, tree)
+    except (KeyError, ValueError, TypeError, AttributeError, ZeroDivisionError) as e:
+        die(f"{path.name}: unexpected project structure ({type(e).__name__}: {e}); "
+            "is it a Kdenlive project saved by a recent Kdenlive?")
+
+
+def _read(path: Path, tree: ET.ElementTree) -> Project:
     root = tree.getroot()
     prof = root.find("profile")
     if root.tag != "mlt" or prof is None:
@@ -150,7 +158,23 @@ def load(path: Path) -> Project:
 
 def player_of(resource: str, players: tuple[Player, ...]) -> int | None:
     name = Path(resource).name
-    return next((i for i, p in enumerate(players) if fnmatch.fnmatch(name, p.source)), None)
+    return next((i for i, p in enumerate(players)
+                 if any(fnmatch.fnmatch(name, pat) for pat in p.source)), None)
+
+
+def with_sources(project: Project, players: tuple[Player, ...]) -> tuple[Player, ...]:
+    """Players without a `source` pattern own the files their voice track uses:
+    the recording that holds someone's voice also holds their view."""
+    out = []
+    for p in players:
+        if not p.source:
+            files = sorted({Path(e.resource).name for e in voice_entries(project, p)})
+            if not files:
+                die(f"{p.name}: the {p.voice_track!r} track has no clips to take the "
+                    "video source from; set source in the theme")
+            p = replace(p, source=tuple(files))
+        out.append(p)
+    return tuple(out)
 
 
 def view_map(project: Project, players: tuple[Player, ...]) -> np.ndarray:
@@ -220,9 +244,11 @@ def _ensure_clip(project: Project, key: str, resource: Path, length: int,
     clipname = f"{CLIP_PREFIX} {key}"
     media = [e for e in root if e.tag in ("chain", "producer")]
     kid = next((props(e)["kdenlive:id"] for e in media
-                if props(e).get("kdenlive:clipname") == clipname), None)
-    if kid is None:
-        kid = str(1 + max((int(props(e).get("kdenlive:id") or 0) for e in media), default=0))
+                if props(e).get("kdenlive:clipname") == clipname
+                and props(e).get("kdenlive:id")), None)
+    if kid is None:   # sequences (tractors) carry bin ids too
+        taken = (props(e).get("kdenlive:id", "") for e in root)
+        kid = str(1 + max((int(k) for k in taken if k.isdigit()), default=0))
         _new_chain(project, f"indspk_{key}_bin", kid)
         ET.SubElement(main_bin, "entry", producer=f"indspk_{key}_bin")
     in_bin = {en.get("producer") for en in main_bin.findall("entry")}
